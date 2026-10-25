@@ -15,7 +15,7 @@ termux-change-repo
 
 ### ขั้นที่ 2 — ติดตั้งด้วยคำสั่งเดียว
 ```bash
-curl -Ls <REPO_RAW_BASE>/setup.sh | bash
+curl -Ls https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/refs/heads/main/setup.sh| bash
 ```
 สคริปต์จะ: ขอสิทธิ์ storage → อัปเดตแพ็กเกจ → ติดตั้ง python, pip, tsu, libexpat, openssl → ติดตั้ง `rich` และ `requests` → ดาวน์โหลด `rejoin.py` ไปที่ `/sdcard/Download/rejoin.py` และ `~/rejoin.py`
 
