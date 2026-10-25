@@ -1,0 +1,4 @@
+# rich: colored tables, live status panel and ASCII logo in the terminal
+rich
+# requests: Roblox APIs (auth check, presence) and Discord webhook uploads
+requests
