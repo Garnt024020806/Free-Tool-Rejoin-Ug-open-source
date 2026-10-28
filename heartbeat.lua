@@ -1,75 +1,56 @@
--- GARNT TOOL REJOIN heartbeat (auto-generated). ID = com.roblox.client
--- WARNING: executors may violate Roblox rules and risk account bans. Use at your own risk.
-local ID = "com.roblox.client"
-local PORT = 8765
-local INTERVAL = 15
-local BASE = "http://127.0.0.1:" .. tostring(PORT)
+-- GARNT TOOL REJOIN heartbeat (auto-generated)
+-- For your own accounts and devices only. Must run through an executor that supports HTTP
+local HOST     = "http://127.0.0.1:8765"
+local ID       = "com.roblox.client"       -- package name or instance number; must match the tool
+local INTERVAL = 15   -- send every N seconds
 
-local env = (getgenv and getgenv()) or _G
-if env.__GARNT_HB_RUNNING then return end
-env.__GARNT_HB_RUNNING = true
+if getgenv then
+    if getgenv().__GARNT_HB then return end
+    getgenv().__GARNT_HB = true
+end
 
 if not game:IsLoaded() then game.Loaded:Wait() end
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local GuiService = game:GetService("GuiService")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
 
 local lp = Players.LocalPlayer
-while not lp do
-	task.wait(0.5)
-	lp = Players.LocalPlayer
-end
+while not lp do task.wait(1); lp = Players.LocalPlayer end
 
-local lastBeat = os.clock()
-RunService.Heartbeat:Connect(function()
-	lastBeat = os.clock()
-end)
-
-local requestFn = (syn and syn.request) or http_request or request or (http and http.request)
-
-local function enc(v)
-	return HttpService:UrlEncode(tostring(v or ""))
-end
+local lastFrame = os.clock()
+RunService.Heartbeat:Connect(function() lastFrame = os.clock() end)
 
 local function httpGet(url)
-	if requestFn then
-		local ok = pcall(function()
-			requestFn({ Url = url, Method = "GET" })
-		end)
-		if ok then return true end
-	end
-	local ok2 = pcall(function()
-		game:HttpGet(url)
-	end)
-	return ok2
+    local req = (syn and syn.request) or http_request or request or (http and http.request)
+    if req then
+        local ok = pcall(req, { Url = url, Method = "GET" })
+        if ok then return true end
+    end
+    return (pcall(function() return game:HttpGet(url) end))
 end
 
-local function errorShowing()
-	local ok, res = pcall(function()
-		local msg = GuiService:GetErrorMessage()
-		if msg and msg ~= "" then return true end
-		local gui = game:GetService("CoreGui"):FindFirstChild("RobloxPromptGui")
-		if gui then
-			local ov = gui:FindFirstChild("promptOverlay")
-			if ov and ov:FindFirstChild("ErrorPrompt") then return true end
-		end
-		return false
-	end)
-	return ok and res == true
+local function errorText()
+    local ok, msg = pcall(function() return GuiService:GetErrorMessage() end)
+    if ok and type(msg) == "string" and msg ~= "" then return msg end
+    return nil
 end
+
+local function beat()
+    if os.clock() - lastFrame > 5 then return end   -- game frozen: do not send
+    local url = string.format("%s/hb?id=%s&user=%s&uid=%d&place=%d&job=%s", HOST,
+        HttpService:UrlEncode(ID), HttpService:UrlEncode(lp.Name), lp.UserId, game.PlaceId,
+        HttpService:UrlEncode(game.JobId))
+    local err = errorText()                          -- Disconnected prompt showing: send the error text immediately
+    if err then url = url .. "&err=" .. HttpService:UrlEncode(string.sub(err, 1, 120)) end
+    httpGet(url)
+end
+
+pcall(function() GuiService.ErrorMessageChanged:Connect(function() pcall(beat) end) end)
 
 task.spawn(function()
-	while true do
-		if (os.clock() - lastBeat) <= 5 and not errorShowing() then
-			local url = BASE .. "/hb?id=" .. enc(ID)
-				.. "&user=" .. enc(lp.Name)
-				.. "&uid=" .. enc(lp.UserId)
-				.. "&place=" .. enc(game.PlaceId)
-				.. "&job=" .. enc(game.JobId)
-			httpGet(url)
-		end
-		task.wait(INTERVAL)
-	end
+    while true do
+        pcall(beat)
+        task.wait(INTERVAL)
+    end
 end)
