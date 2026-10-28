@@ -23,7 +23,7 @@ An automatic Roblox rejoin tool for UG Phone + Termux (for use with your own acc
 ```
 termux-change-repo
 ```
-Move with the arrow keys, press Space to select "Single mirror" (or Mirror group) → choose a nearby mirror (e.g. Singapore / Asia) → OK.
+just enter untill download is done
 If you skip this and `pkg update` is slow or gives a 404 error, come back and do it again.
 
 ### Step 2 — Install with one command
