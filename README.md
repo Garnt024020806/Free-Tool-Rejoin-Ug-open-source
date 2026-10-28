@@ -28,7 +28,7 @@ If you skip this and `pkg update` is slow or gives a 404 error, come back and do
 
 ### Step 2 — Install with one command
 ```
-curl -Ls https://raw.githubusercontent.com/Garnt024020806/TOOL/main/setup.sh | bash
+curl -Ls https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/main/setup.sh | bash
 ```
 The script does the following in order: `termux-setup-storage` → `pkg update/upgrade` → `python`, `python-pip`, `tsu`, `libexpat`, `openssl` → `pip install -r requirements.txt` → downloads `rejoin.py` to `/sdcard/Download/rejoin.py` (with a copy at `~/rejoin.py`).
 
