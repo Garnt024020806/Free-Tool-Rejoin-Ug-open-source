@@ -1,3 +1,3 @@
 #!/bin/bash
-pkg update && yes | pkg upgrade && yes | pkg i python && yes | pkg install python-pip && pkg install python tsu libexpat openssl -y && curl -Ls "https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/refs/heads/main/requirements.txt" -o "$HOME/requirements.txt" && pip install -r "$HOME/requirements.txt"
+pkg update && yes | pkg upgrade && yes | pkg i python && yes | pkg install python-pip && pkg install python tsu libexpat openssl -y && curl -Ls "https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/main/requirements.txt" -o "$HOME/requirements.txt" && pip install -r "$HOME/requirements.txt"
 curl -Ls "https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/refs/heads/main/rejoin.py" -o /sdcard/Download/rejoin.py && cp /sdcard/Download/rejoin.py "$HOME/rejoin.py"
