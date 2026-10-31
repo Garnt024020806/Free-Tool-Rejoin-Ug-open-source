@@ -46,7 +46,7 @@ except ImportError as _e:
     print("Required library not found: %s\nRun: pip install -r requirements.txt" % _e)
     sys.exit(1)
 
-VERSION = "1.5"
+VERSION = "1.6"
 TERMUX = "/data/data/com.termux/files"
 LOGO = r"""
   ____    _    ____  _   _ _____
@@ -118,6 +118,29 @@ def mask(cookie):
     return "********  (%d chars)" % len(cookie)
 
 
+# ----------------------------------------------------------------- streamer mode (display only)
+STREAMER = {"on": True}
+USERS = set()   # account names seen so far (used to mask them inside free text)
+
+
+def hide_name(name):
+    """First 4 characters stay visible, the rest becomes # (screen only; data and logs are unchanged)."""
+    name = str(name or "")
+    if not STREAMER["on"] or len(name) <= 4:
+        return name
+    return name[:4] + "#" * (len(name) - 4)
+
+
+def hide_users(text):
+    if not STREAMER["on"]:
+        return text
+    for u in sorted(list(USERS), key=len, reverse=True):
+        if len(u) > 4:
+            text = re.sub(r"(?<![A-Za-z0-9_.])%s(?![A-Za-z0-9_])" % re.escape(u),
+                          lambda m, r=hide_name(u): r, text)
+    return text
+
+
 class ScrubFilter(logging.Filter):
     def filter(self, record):
         record.msg = scrub(record.getMessage())
@@ -154,13 +177,15 @@ DEFAULTS = {
         "foreground_check": False,
         "screenshot_on_crash": True,
         "cookie_login_on_start": False,
+        "cookie_pull_on_start": False,
         "presence_check": True,
         "timed_rejoin_min": 0,
     },
-    "heartbeat": {"enabled": True, "port": 8765, "interval": 15, "timeout": 90},
+    "heartbeat": {"enabled": True, "port": 8765, "interval": 15, "timeout": 90, "show_fps": True},
     "autoexec": {"auto_create": True, "enabled_once": False, "filename": "heartbeat.lua",
                  "dirs": ["/storage/emulated/0/Delta/Autoexecute"]},   # {pkg} in a path = one folder per clone
     "performance": {"low_cpu": True, "ui_refresh_sec": 2},
+    "ui": {"streamer_mode": True},   # hide account names on screen (first 4 chars + #)
     "console_webhook": {"enabled": False, "url": "", "flush_sec": 10},   # blank url = reuse the main webhook
     "dialog_detect": {"enabled": True, "every_sec": 30, "confirm": 2},
     "screen_guard": {"enabled": True, "check_sec": 60, "fix_stacked": True, "kill_stray": False,
@@ -325,6 +350,71 @@ def mem_available_mb():
         return int(kb / 1024)
     except Exception:
         return None
+
+
+class CpuMeter:
+    """CPU usage from /proc/stat deltas (root fallback; last resort: load average / cores)."""
+
+    def __init__(self):
+        self.prev, self.prev_t = None, 0.0     # sample at the previous read -> average since then
+
+    @staticmethod
+    def _sample():
+        line = ""
+        try:
+            with open("/proc/stat") as f:
+                line = f.readline()
+        except OSError:
+            pass
+        if not line.startswith("cpu") and ENV.root:
+            _, out = sh("head -n 1 /proc/stat", root=True, timeout=10)
+            line = out.strip().splitlines()[0] if out.strip() else ""
+        try:
+            n = [int(x) for x in line.split()[1:9]]
+        except ValueError:
+            return None
+        if not line.startswith("cpu") or len(n) < 4:
+            return None
+        return n[3] + (n[4] if len(n) > 4 else 0), sum(n)    # (idle+iowait, total)
+
+    @staticmethod
+    def _pct(a, b):
+        di, dt = b[0] - a[0], b[1] - a[1]
+        return None if dt <= 0 else max(0.0, min(100.0, 100.0 * (1 - di / dt)))
+
+    def read(self, wait=1.0):
+        """-> {"now": % over `wait` seconds, "avg": % since the previous read or None, "cores": n, "approx": bool}"""
+        cores = os.cpu_count() or 1
+        a = self._sample()
+        if a is None:
+            load = sys_load()
+            return {"now": None if load is None else min(100.0, 100.0 * load / cores),
+                    "avg": None, "cores": cores, "approx": True}
+        time.sleep(wait)
+        b = self._sample() or a
+        avg = self._pct(self.prev, b) if self.prev and time.time() - self.prev_t >= 20 else None
+        self.prev, self.prev_t = b, time.time()
+        return {"now": self._pct(a, b), "avg": avg, "cores": cores, "approx": False}
+
+
+CPU = CpuMeter()
+
+
+def cpu_text():
+    """Webhook text: CPU % now (1 s sample) + average since the previous report."""
+    try:
+        r = CPU.read()
+    except Exception:
+        return "-"
+    if r["now"] is None:
+        return "-"
+    s = ("~%.0f%%" if r["approx"] else "%.0f%%") % r["now"]
+    if r["avg"] is not None:
+        s += " | avg %.0f%%" % r["avg"]
+    s += " | %d cores" % r["cores"]
+    if r["approx"]:
+        s += " (estimated from load average)"
+    return s
 
 
 def AM():
@@ -668,6 +758,7 @@ COOKIE_TEMPLATE = (
     "# Put the .ROBLOSECURITY cookie of your own accounts here, 1 line per account\n"
     "# Order follows the detected instances (first line = first package). Never share this file\n"
     "# Blank lines and lines starting with # are skipped\n"
+    "# A line with just - = no cookie for that instance (keeps the order)\n"
 )
 
 
@@ -687,6 +778,7 @@ def ensure_cookie_file():
 
 
 def read_cookies():
+    """One entry per cookie line; a line that is just '-' is a placeholder (no cookie for that instance) -> ''."""
     res = []
     try:
         with open(COOKIE_PATH, encoding="utf-8-sig") as f:
@@ -694,17 +786,18 @@ def read_cookies():
                 l = line.strip()
                 if not l or l.startswith("#"):
                     continue
-                res.append(clean_cookie(l))
+                res.append("" if l == "-" else clean_cookie(l))
     except OSError:
         return []
-    SECRETS.update(res)
+    SECRETS.update(c for c in res if c)
     return res
 
 
 def cookie_pairs(cfg):
-    """Map cookie lines to ALL detected instances in order."""
+    """Map cookie lines to ALL detected instances in order (placeholder lines are skipped)."""
     ck = read_cookies()
-    return [(pkg, ck[i]) for i, pkg in enumerate(cfg.d["detected"]) if i < len(ck)], len(ck)
+    pairs = [(pkg, ck[i]) for i, pkg in enumerate(cfg.d["detected"]) if i < len(ck) and ck[i]]
+    return pairs, len([c for c in ck if c])
 
 
 UA = "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
@@ -726,7 +819,9 @@ def who_am_i(s):
         if r.status_code != 200:
             return None, None, "HTTP %d" % r.status_code
         j = r.json()
-        return j["id"], j.get("name", "?"), None
+        name = j.get("name", "?")
+        USERS.add(name)
+        return j["id"], name, None
     except Exception as e:
         return None, None, scrub(e)[:80]
 
@@ -823,8 +918,103 @@ def cookie_login(pairs):
             res.append((pkg, False, "Cookie unusable: %s" % err))
             continue
         ok, msg = inject_cookie(pkg, ck)
-        res.append((pkg, ok, ("%s: %s" % (name, msg)) if ok else msg))
+        res.append((pkg, ok, ("%s: %s" % (hide_name(name), msg)) if ok else msg))
     return res
+
+
+def find_cookie_db(pkg):
+    _, out = sh("find /data/data/%s -maxdepth 4 -type f -name Cookies 2>/dev/null | head -n 1" % shlex.quote(pkg), root=True)
+    return out.strip().splitlines()[0].strip() if out.strip() else ""
+
+
+def read_app_cookie(pkg):
+    """Root only: read .ROBLOSECURITY from the clone's WebView cookie DB (works on a copy, never edits the app).
+    -> (cookie | None, message)"""
+    if not ENV.root:
+        return None, "Root required"
+    path = find_cookie_db(pkg)
+    if not path:
+        return None, "Cookie database not found (open the app once first)"
+    tmpd = tempfile.mkdtemp(prefix="garnt_", dir=TMP_DIR)
+    try:
+        s, t = shlex.quote(path), shlex.quote(tmpd)
+        rc, _ = sh("cp %s %s/ && chmod -R a+rw %s" % (s, t, t), root=True)
+        if rc != 0:
+            return None, "Could not copy the database"
+        sh("cp %s-wal %s-shm %s-journal %s/ 2>/dev/null; chmod -R a+rw %s" % (s, s, s, t, t), root=True)
+        con = sqlite3.connect(os.path.join(tmpd, os.path.basename(path)), timeout=10)
+        try:
+            con.text_factory = lambda b: b.decode("utf-8", "replace")
+            sel = "SELECT value, encrypted_value FROM cookies WHERE name='.ROBLOSECURITY' AND host_key LIKE '%roblox.com'"
+            try:
+                rows = con.execute(sel + " ORDER BY last_access_utc DESC").fetchall()
+            except sqlite3.OperationalError:
+                rows = con.execute(sel).fetchall()
+        finally:
+            con.close()
+        for val, enc in rows:
+            val = (val or "").strip()
+            if val:
+                ck = clean_cookie(val)
+                SECRETS.add(ck)
+                return ck, "ok"
+        if any(enc for _, enc in rows):
+            return None, "The cookie in the app is encrypted and cannot be read"
+        return None, "No cookie found (this app is not logged in)"
+    except Exception as e:
+        return None, scrub(e)[:100]
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def pull_validated(pkgs):
+    """Read each clone's cookie and check it with the Roblox API. -> [(pkg, cookie|None, name|None, message)]"""
+    out = []
+    for pkg in pkgs:
+        ck, msg = read_app_cookie(pkg)
+        if not ck:
+            out.append((pkg, None, None, msg))
+            continue
+        uid, name, err = who_am_i(make_session(ck))
+        if uid:
+            out.append((pkg, ck, name, ""))
+        else:
+            out.append((pkg, None, None, "The cookie in the app is not usable: " + str(err)))
+    return out
+
+
+def store_cookies(cfg, found):
+    """found = {pkg: cookie}. Updates cookie.txt in place: comments are kept, the line order follows the detected
+    instances, and gaps are filled with '-'. Returns how many lines were written."""
+    det = cfg.d["detected"]
+    upd = {det.index(p): c for p, c in found.items() if p in det}
+    if not upd:
+        return 0
+    try:
+        with open(COOKIE_PATH, encoding="utf-8-sig") as f:
+            raw = f.read().splitlines()
+    except OSError:
+        raw = COOKIE_TEMPLATE.splitlines()
+    pos = [n for n, l in enumerate(raw) if l.strip() and not l.strip().startswith("#")]
+    for i in sorted(upd):
+        if i < len(pos):
+            raw[pos[i]] = upd[i]
+        else:
+            while len(pos) < i:
+                raw.append("-")
+                pos.append(len(raw) - 1)
+            raw.append(upd[i])
+            pos.append(len(raw) - 1)
+    tmp = COOKIE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(raw) + "\n")
+    os.replace(tmp, COOKIE_PATH)
+    try:
+        os.chmod(COOKIE_PATH, 0o600)
+    except OSError:
+        pass
+    SECRETS.update(upd.values())
+    return len(upd)
 
 
 # ----------------------------------------------------------------- discord webhook
@@ -882,6 +1072,7 @@ LUA_TEMPLATE = r"""-- GARNT TOOL REJOIN heartbeat (auto-generated)
 local HOST     = "http://127.0.0.1:__PORT__"
 local ID       = "__ID__"       -- package name or instance number; must match the tool
 local INTERVAL = __INTERVAL__   -- send every N seconds
+local SHOW_FPS = __SHOWFPS__    -- true = show the draggable FPS box on screen
 
 if getgenv then
     if getgenv().__GARNT_HB then return end
@@ -893,12 +1084,22 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
+local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
 while not lp do task.wait(1); lp = Players.LocalPlayer end
 
 local lastFrame = os.clock()
-RunService.Heartbeat:Connect(function() lastFrame = os.clock() end)
+local frames, fps, winStart = 0, 0, os.clock()
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    lastFrame = now
+    frames = frames + 1
+    if now - winStart >= 1 then
+        fps = math.floor(frames / (now - winStart) + 0.5)
+        frames, winStart = 0, now
+    end
+end)
 
 local function httpGet(url)
     local req = (syn and syn.request) or http_request or request or (http and http.request)
@@ -917,9 +1118,9 @@ end
 
 local function beat()
     if os.clock() - lastFrame > 5 then return end   -- game frozen: do not send
-    local url = string.format("%s/hb?id=%s&user=%s&uid=%d&place=%d&job=%s", HOST,
+    local url = string.format("%s/hb?id=%s&user=%s&uid=%d&place=%d&job=%s&fps=%d", HOST,
         HttpService:UrlEncode(ID), HttpService:UrlEncode(lp.Name), lp.UserId, game.PlaceId,
-        HttpService:UrlEncode(game.JobId))
+        HttpService:UrlEncode(game.JobId), fps)
     local err = errorText()                          -- Disconnected prompt showing: send the error text immediately
     if err then url = url .. "&err=" .. HttpService:UrlEncode(string.sub(err, 1, 120)) end
     httpGet(url)
@@ -933,11 +1134,124 @@ task.spawn(function()
         task.wait(INTERVAL)
     end
 end)
+
+-- FPS box: black fill, white border, drag it anywhere (position is remembered if the executor supports writefile)
+local POS_FILE = "garnt_fps_pos.txt"
+
+local function parentGui(gui)
+    local ok = false
+    if gethui then ok = pcall(function() gui.Parent = gethui() end) end
+    if not ok or not gui.Parent then
+        ok = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+    end
+    if not ok or not gui.Parent then
+        local pg = lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 10)
+        if pg then gui.Parent = pg end
+    end
+    return gui.Parent ~= nil
+end
+
+local function loadPos()
+    if not (isfile and readfile) then return nil end
+    local ok, data = pcall(function() if isfile(POS_FILE) then return readfile(POS_FILE) end end)
+    if ok and type(data) == "string" then
+        local x, y = string.match(data, "^(%-?%d+),(%-?%d+)$")
+        if x then return tonumber(x), tonumber(y) end
+    end
+    return nil
+end
+
+local function savePos(x, y)
+    if writefile then pcall(writefile, POS_FILE, string.format("%d,%d", x, y)) end
+end
+
+local function buildFpsBox()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "GARNT_FPS"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999999
+    if not parentGui(gui) then return end
+
+    local W, H = 104, 34
+    local box = Instance.new("Frame")
+    box.Name = "Box"
+    box.Size = UDim2.fromOffset(W, H)
+    box.BackgroundColor3 = Color3.fromRGB(0, 0, 0)       -- black fill
+    box.BackgroundTransparency = 0
+    box.BorderSizePixel = 0
+    box.Active = true
+    box.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = box
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 255, 255)         -- white border
+    stroke.Thickness = 2
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = box
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 18
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Text = "FPS --"
+    label.Parent = box
+
+    local function clamp(x, y)
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        return math.clamp(x, 0, math.max(0, vp.X - W)), math.clamp(y, 0, math.max(0, vp.Y - H))
+    end
+
+    local sx, sy = loadPos()
+    if not sx then sx, sy = 12, 64 end
+    sx, sy = clamp(sx, sy)
+    box.Position = UDim2.fromOffset(sx, sy)
+
+    local dragging, dragStart, startX, startY = false, nil, 0, 0
+    box.InputBegan:Connect(function(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startX, startY = box.Position.X.Offset, box.Position.Y.Offset
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    savePos(box.Position.X.Offset, box.Position.Y.Offset)
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+            local x, y = clamp(startX + (input.Position.X - dragStart.X), startY + (input.Position.Y - dragStart.Y))
+            box.Position = UDim2.fromOffset(x, y)
+        end
+    end)
+
+    while gui.Parent do
+        label.Text = (fps > 0) and ("FPS " .. tostring(fps)) or "FPS --"
+        task.wait(0.5)
+    end
+end
+
+if SHOW_FPS then
+    task.spawn(function() pcall(buildFpsBox) end)
+end
 """
 
 
-def render_lua(inst_id, port, interval):
+def render_lua(inst_id, port, interval, show_fps=True):
     return (LUA_TEMPLATE.replace("__PORT__", str(int(port))).replace("__INTERVAL__", str(int(interval)))
+            .replace("__SHOWFPS__", "true" if show_fps else "false")
             .replace("__ID__", re.sub(r"[^\w.\-]", "", str(inst_id))))
 
 
@@ -950,7 +1264,7 @@ def write_heartbeat_files(cfg):
     for i, pkg in enumerate(det, 1):
         p = os.path.join(d, "heartbeat_%d_%s.lua" % (i, pkg.split(".")[-1]))
         with open(p, "w", encoding="utf-8") as f:
-            f.write(render_lua(pkg, h["port"], h["interval"]))
+            f.write(render_lua(pkg, h["port"], h["interval"], h.get("show_fps", True)))
         paths.append(p)
     return paths
 
@@ -1002,7 +1316,7 @@ def install_autoexec(cfg):
     res = []
     for d, ident in autoexec_targets(cfg):
         path = os.path.join(d, a["filename"])
-        src = render_lua(ident, h["port"], h["interval"])
+        src = render_lua(ident, h["port"], h["interval"], h.get("show_fps", True))
         try:
             old = None
             if os.path.exists(path):
@@ -1048,11 +1362,13 @@ class Heartbeats:
             return False
         rec = {"ts": time.time(), "user": re.sub(r"[^\w .\-]", "", q.get("user", ""))[:30],
                "uid": q.get("uid", "")[:20], "place": q.get("place", "")[:20], "job": q.get("job", "")[:64],
-               "err": re.sub(r"[^\w .:()\-]", "", q.get("err", ""))[:120]}
+               "err": re.sub(r"[^\w .:()\-]", "", q.get("err", ""))[:120],
+               "fps": re.sub(r"\D", "", q.get("fps", ""))[:4]}
         with self.lock:
             self.d[key] = rec
             if rec["user"]:
                 self.by_user[rec["user"]] = rec
+                USERS.add(rec["user"])
         return True
 
     def latest(self, inst):
@@ -1260,7 +1576,7 @@ def sys_load():
         return None
 
 
-CONSOLE_HELP = ("Commands: rejoin <n|all> | pause <n|all> | resume <n|all> | status | ram | shot | clear | help | quit")
+CONSOLE_HELP = ("Commands: rejoin <n|all> | pause <n|all> | resume <n|all> | status | ram | shot | clear | streamer | help | quit")
 
 
 # ----------------------------------------------------------------- engine
@@ -1410,6 +1726,12 @@ class Engine:
         else:
             self.event("RAM clear failed: %s" % RAM_LAST["detail"], "red")
 
+    def _fps_txt(self, inst):
+        rec = self.hb.latest(inst) if self.hb else None
+        if rec and rec.get("fps") and time.time() - rec["ts"] <= int(self.cfg.d["heartbeat"]["timeout"]):
+            return " | FPS " + rec["fps"]
+        return ""
+
     def report(self, minutes, shot=None):
         w = self.cfg.d["webhook"]
         if not (w["enabled"] and w["url"] and (w["events"].get("status") or minutes is None)):
@@ -1418,9 +1740,10 @@ class Engine:
             shot = take_shot("status")
         mem = mem_available_mb()
         fields = [(i.label, "%s | rejoins %d | fails %d%s" % (STATE_LABEL.get(i.state, (i.state,))[0], i.rejoins, i.fails,
-                                                              (" | " + i.user) if i.user else "")) for i in self.insts][:22]
+                                                              (" | " + i.user) if i.user else "") + self._fps_txt(i)) for i in self.insts][:22]
         fields.append(("Free RAM", ("%d MB" % mem) if mem is not None else "-"))
         fields.append(("Uptime", fmt_dur(time.time() - self.t0)))
+        fields.append(("CPU", cpu_text()))
         self.hook.send("status", "📸 Status report", "On-demand report" if minutes is None else "Periodic report every %d min" % minutes, fields, shot)
 
     # -- console commands (typed in the live panel)
@@ -1468,6 +1791,11 @@ class Engine:
         elif cmd == "status":
             for i in self.insts:
                 self.event("#%d %s | %s" % (i.idx, STATE_LABEL.get(i.state, (i.state,))[0], i.detail or "-"))
+        elif cmd in ("streamer", "hide"):
+            on = (not STREAMER["on"]) if not args else args[0] in ("on", "1", "yes", "y")
+            STREAMER["on"] = self.cfg.d["ui"]["streamer_mode"] = on
+            self.cfg.save()
+            self.event("Streamer mode (hide account names): " + ("ON" if on else "OFF"), "cyan")
         elif cmd in ("ram", "shot", "clear"):
             if not ENV.root:
                 self.event("Command %s requires root" % cmd, "red")
@@ -1588,7 +1916,7 @@ class Engine:
             inst.user = rec["user"]
         who = (" [%s]" % rec["user"]) if rec["user"] else ""
         if age <= int(hc["timeout"]):
-            return "ok", "heartbeat %ds ago%s" % (age, who)
+            return "ok", "heartbeat %ds ago%s%s" % (age, who, (" | FPS " + rec["fps"]) if rec.get("fps") else "")
         return "stale", "no heartbeat for %ds%s" % (age, who)
 
     def check(self, inst):
@@ -1692,14 +2020,14 @@ class Engine:
             label, style = STATE_LABEL.get(i.state, (i.state, ""))
             nxt = "%ds" % max(0, int(i.next_at - now)) if i.next_at and i.state in ("ok", "unknown", "joining", "backoff") else "-"
             up = fmt_dur(now - i.ok_since) if i.ok_since and i.state == "ok" else "-"
-            t.add_row(str(i.idx), i.pkg, i.user or "-", Text(label, style=style), up, str(i.fails),
-                      str(i.rejoins), nxt, T(i.detail))
+            t.add_row(str(i.idx), i.pkg, hide_name(i.user) or "-", Text(label, style=style), up, str(i.fails),
+                      str(i.rejoins), nxt, T(hide_users(i.detail)))
         # fit the terminal: fixed rows = head 4 + table (n+5) + console 3 + events border 2
         n_ev = max(1, min(8, console.size.height - (len(self.insts) + 14)))
         ev = Text(no_wrap=True, overflow="ellipsis")
         for ts, msg, st in list(reversed(self.events))[:n_ev]:   # newest first so cropping never hides the latest
             ev.append(ts + "  ", style="dim")
-            ev.append(msg + "\n", style=st)
+            ev.append(hide_users(msg) + "\n", style=st)
         parts = [Panel(head, title="GARNT TOOL REJOIN", border_style="cyan"), t]
         if buf is not None:
             parts.append(Panel(Text.assemble(("› ", "bold yellow"), (scrub(buf), "bold"), ("█", "blink")),
@@ -1782,6 +2110,18 @@ def menu_start(cfg, hook):
     if not pkgs:
         say("No Roblox packages found. Go to Menu 4 to scan first", "red")
         return pause()
+    if cfg.d["auto"]["cookie_pull_on_start"] and ENV.root:
+        have = {p for p, _ in cookie_pairs(cfg)[0]}
+        need = [p for p in pkgs if p not in have]
+        if need:
+            say("Pulling cookies from %d app(s) that have none yet..." % len(need), "dim")
+            got = {}
+            for pkg, ck, name, msg in pull_validated(need):
+                if ck:
+                    got[pkg] = ck
+                say("%s: %s" % (pkg, ("Got the cookie of " + hide_name(name)) if ck else msg), "green" if ck else "yellow")
+            if got:
+                store_cookies(cfg, got)
     if cfg.d["auto"]["cookie_login_on_start"]:
         if ENV.root:
             pairs = [(p, c) for p, c in cookie_pairs(cfg)[0] if p in pkgs]
@@ -1875,6 +2215,7 @@ def menu_settings(cfg):
         t.add_row("1", "Game link / Place ID", T((link[:60] + "…" if len(link) > 60 else link) or "(not set)"))
         t.add_row("2", "Check interval (seconds)", str(cfg.d["check_interval"]))
         t.add_row("3", "Delay between launching instances (seconds)", str(cfg.d["launch_delay"]))
+        t.add_row("4", "Hide account names (streamer mode: first 4 chars shown, rest as #)", onoff(cfg.d["ui"]["streamer_mode"]))
         console.print(t)
         if p:
             say("Link actually used to launch: " + p[0], "dim")
@@ -1889,6 +2230,9 @@ def menu_settings(cfg):
             elif v:
                 cfg.d["game_link"] = v
                 cfg.save()
+        elif c == "4":
+            cfg.d["ui"]["streamer_mode"] = STREAMER["on"] = not cfg.d["ui"]["streamer_mode"]
+            cfg.save()
         elif c in ("2", "3"):
             key, lo = ("check_interval", 10) if c == "2" else ("launch_delay", 0)
             v = ask("New value (seconds, minimum %d):" % lo)
@@ -1950,7 +2294,7 @@ def menu_cookie(cfg):
         uid, name, err = who_am_i(make_session(ck))
         if uid:
             valid.append((pkg, ck))
-        t.add_row(str(i), pkg, mask(ck), Text(("Valid: " + name) if uid else ("Invalid: " + str(err)),
+        t.add_row(str(i), pkg, mask(ck), Text(("Valid: " + hide_name(name)) if uid else ("Invalid: " + str(err)),
                                               style="green" if uid else "red"))
     console.print(t)
     if not ENV.root:
@@ -1962,6 +2306,51 @@ def menu_cookie(cfg):
     pause()
 
 
+def menu_cookie_pull(cfg):
+    if not ENV.root:
+        say("Pulling cookies from the apps requires root", "yellow")
+        return pause()
+    det = cfg.d["detected"]
+    if not det:
+        say("No packages found yet; try menu 4 (scan packages)", "red")
+        return pause()
+    say("Reading the cookie of %d instance(s) and checking it with the Roblox API..." % len(det), "dim")
+    results = pull_validated(det)
+    t = Table(title="Cookies pulled from the Roblox apps", box=box.ROUNDED, header_style="bold cyan")
+    for col in ("#", "Package", "Account", "Result"):
+        t.add_column(col)
+    found = {}
+    for i, (pkg, ck, name, msg) in enumerate(results, 1):
+        if ck:
+            found[pkg] = ck
+        t.add_row(str(i), pkg, hide_name(name) if name else "-",
+                  Text(("Pulled, valid: " + mask(ck)) if ck else msg, style="green" if ck else "red"))
+    console.print(t)
+    if found and confirm("Save %d cookie(s) to cookie.txt (replaces that instance's line)?" % len(found)):
+        n = store_cookies(cfg, found)
+        say("Saved %d line(s) → " % n + COOKIE_PATH, "green")
+        say("These cookies will be used for the in-game API check while rejoining (enable the Roblox API presence check in menu 6)", "dim")
+    pause()
+
+
+def menu_cookie_hub(cfg):
+    while True:
+        banner(cfg)
+        t = Table(title="Cookies", box=box.ROUNDED, header_style="bold cyan")
+        for col in ("#", "Item"):
+            t.add_column(col)
+        t.add_row("1", "Check / inject the cookies from cookie.txt into the apps (cookie login)")
+        t.add_row("2", "Pull the cookies from the Roblox apps into cookie.txt (for the API status check) - root")
+        console.print(t)
+        c = ask("Choose a number (0=back)")
+        if c == "0":
+            return
+        if c == "1":
+            menu_cookie(cfg)
+        elif c == "2":
+            menu_cookie_pull(cfg)
+
+
 AUTO_ITEMS = [
     ("start_on_launch", "Start rejoining as soon as the tool opens", False),
     ("wake_lock", "Wake-lock while running", False),
@@ -1970,6 +2359,7 @@ AUTO_ITEMS = [
     ("screenshot_on_crash", "Screenshot when dropped/frozen", True),
     ("cookie_login_on_start", "Automatic cookie login before start", True),
     ("presence_check", "Check in-game state via the Roblox API (needs cookies)", False),
+    ("cookie_pull_on_start", "Auto-pull cookies from the apps before start (only instances without a cookie)", True),
 ]
 
 
@@ -2027,6 +2417,7 @@ def menu_heartbeat(cfg):
         t.add_row("6", "Delta autoexec folder (use {pkg} for one folder per clone)", T(", ".join(cfg.d["autoexec"]["dirs"])))
         t.add_row("7", "Auto create/update heartbeat.lua in that folder", onoff(cfg.d["autoexec"]["auto_create"]))
         t.add_row("8", "Create/update heartbeat.lua now", "")
+        t.add_row("9", "Show the FPS box on the game screen (draggable, black with white border)", onoff(h["show_fps"]))
         console.print(t)
         c = ask("Choose a number (0=back)")
         if c == "0":
@@ -2057,6 +2448,12 @@ def menu_heartbeat(cfg):
         elif c == "8":
             report_autoexec(cfg, install_autoexec(cfg), quiet_ok=False)
             pause()
+        elif c == "9":
+            h["show_fps"] = not h["show_fps"]
+            if cfg.d["autoexec"]["auto_create"]:
+                report_autoexec(cfg, install_autoexec(cfg), quiet_ok=False)
+                say("The new script loads the next time the game starts (rejoin or relaunch)", "dim")
+                pause()
         cfg.save()
 
 
@@ -2262,12 +2659,13 @@ def menu_webhook(cfg, hook):
 
 MENU = [("1", "Start auto-rejoin"), ("2", "Show instances / status"),
         ("3", "Settings (game link, check interval, launch delay)"), ("4", "Scan packages"),
-        ("5", "Cookie login (optional)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("0", "Exit")]
+        ("5", "Cookies (login / pull from the Roblox app)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("0", "Exit")]
 
 
 def main():
     detect_root()
     cfg = Config()
+    STREAMER["on"] = bool(cfg.d["ui"]["streamer_mode"])
     setup_logging()
     hook = Hook(cfg)
     apply_perf(cfg)
@@ -2300,7 +2698,7 @@ def main():
         elif c == "4":
             menu_scan(cfg)
         elif c == "5":
-            menu_cookie(cfg)
+            menu_cookie_hub(cfg)
         elif c == "6":
             menu_auto(cfg)
         elif c == "7":
