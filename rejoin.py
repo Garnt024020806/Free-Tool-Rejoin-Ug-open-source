@@ -2306,6 +2306,165 @@ def menu_cookie(cfg):
     pause()
 
 
+def api_post(s, url, body=None):
+    """POST with CSRF retry -> (ok, message)"""
+    try:
+        r = s.post(url, json=body, timeout=15)
+        if r.status_code == 403 and "x-csrf-token" in r.headers:
+            s.headers["X-CSRF-TOKEN"] = r.headers["x-csrf-token"]
+            r = s.post(url, json=body, timeout=15)
+    except Exception as e:
+        return False, scrub(e)[:80]
+    msg = ""
+    try:
+        j = r.json()
+        msg = (j.get("errors") or [{}])[0].get("message", "")
+        if r.status_code == 200 and j.get("success") is False:
+            return False, msg or "success=false"
+    except Exception:
+        pass
+    if r.status_code == 200:
+        return True, "ok"
+    if r.status_code == 401:
+        msg = "cookie expired"
+    elif r.status_code == 429:
+        msg = "too many requests, wait a while"
+    return False, ("HTTP %d %s" % (r.status_code, msg)).strip()
+
+
+def resolve_user(s, text):
+    """username or numeric ID -> (id, name) or (None, None)"""
+    text = text.strip().lstrip("@")
+    try:
+        if text.isdigit():
+            r = s.get("https://users.roblox.com/v1/users/%s" % text, timeout=12)
+            if r.status_code == 200:
+                j = r.json()
+                USERS.add(j.get("name", ""))
+                return j["id"], j.get("name", "?")
+            return None, None
+        r = s.post("https://users.roblox.com/v1/usernames/users",
+                   json={"usernames": [text], "excludeBannedUsers": False}, timeout=12)
+        d = r.json().get("data") or []
+        if d:
+            USERS.add(d[0]["name"])
+            return d[0]["id"], d[0]["name"]
+    except Exception:
+        pass
+    return None, None
+
+
+SOCIAL_URL = {"block": "https://accountsettings.roblox.com/v1/users/%d/block",
+              "unblock": "https://accountsettings.roblox.com/v1/users/%d/unblock",
+              "friend": "https://friends.roblox.com/v1/users/%d/request-friendship",
+              "accept": "https://friends.roblox.com/v1/users/%d/accept-friend-request"}
+SOCIAL_NAME = {"block": "Block", "unblock": "Unblock", "friend": "Send friend request"}
+
+
+def social_accounts(cfg):
+    """Accounts that have a valid cookie in cookie.txt -> [(pkg, session, uid, name)]"""
+    out = []
+    for pkg, ck in cookie_pairs(cfg)[0]:
+        s = make_session(ck)
+        uid, name, err = who_am_i(s)
+        if uid:
+            out.append((pkg, s, uid, name))
+        else:
+            say("%s: cookie not usable (%s)" % (pkg, err), "red")
+    return out
+
+
+def pick_accounts(accts):
+    v = ask("Which accounts (e.g. 1,3 or all, Enter=all):").strip().lower()
+    if v in ("", "all", "a"):
+        return list(accts)
+    idx = {int(x) for x in v.replace(" ", "").split(",") if x.isdigit()}
+    return [a for n, a in enumerate(accts, 1) if n in idx]
+
+
+def run_social(action, accts, tid):
+    """Every selected account does `action` on user tid. -> [(pkg, name, ok, message)]"""
+    rows = []
+    for pkg, s, uid, name in accts:
+        if uid == tid:
+            rows.append((pkg, name, False, "same as the target, skipped"))
+            continue
+        ok, msg = api_post(s, SOCIAL_URL[action] % tid, {} if action != "friend" else None)
+        rows.append((pkg, name, ok, msg))
+        time.sleep(1.5)     # stay under the rate limit
+    return rows
+
+
+def show_social(rows):
+    t = Table(box=box.ROUNDED, header_style="bold cyan")
+    for col in ("Package", "Account", "Result"):
+        t.add_column(col)
+    for pkg, name, ok, msg in rows:
+        t.add_row(pkg, hide_name(name), Text(("✓ " if ok else "✗ ") + msg, style="green" if ok else "red"))
+    console.print(t)
+
+
+def menu_social(cfg):
+    if not cookie_pairs(cfg)[0]:
+        say("No cookies in cookie.txt yet (menu 5)", "red")
+        return pause()
+    say("Checking the accounts from the cookies...", "dim")
+    accts = social_accounts(cfg)
+    if not accts:
+        return pause()
+    while True:
+        banner(cfg)
+        t = Table(title="Block / friends (using the cookie accounts)", box=box.ROUNDED, header_style="bold cyan")
+        for col in ("#", "Item"):
+            t.add_column(col)
+        t.add_row("1", "Block a user")
+        t.add_row("2", "Unblock a user")
+        t.add_row("3", "Add friend (send a request to a user)")
+        t.add_row("4", "Friend our own accounts with each other (send + auto-accept)")
+        console.print(t)
+        a = Table(box=box.SIMPLE, header_style="bold cyan")
+        for col in ("#", "Package", "Account"):
+            a.add_column(col)
+        for n, (pkg, _, _, name) in enumerate(accts, 1):
+            a.add_row(str(n), pkg, hide_name(name))
+        console.print(a)
+        c = ask("Choose a number (0=back)")
+        if c == "0":
+            return
+        if c in ("1", "2", "3"):
+            action = {"1": "block", "2": "unblock", "3": "friend"}[c]
+            who = ask("Target username or user ID:")
+            tid, tname = resolve_user(accts[0][1], who) if who else (None, None)
+            if not tid:
+                say("User not found", "red")
+                pause()
+                continue
+            sel = pick_accounts(accts)
+            if sel and confirm("%s %s (%d) with %d account(s)?" % (SOCIAL_NAME[action], hide_name(tname), tid, len(sel))):
+                show_social(run_social(action, sel, tid))
+                pause()
+        elif c == "4":
+            sel = pick_accounts(accts)
+            if len(sel) < 2:
+                say("Pick at least 2 accounts", "red")
+                pause()
+                continue
+            if not confirm("Friend %d accounts with each other?" % len(sel)):
+                continue
+            rows = []
+            for i in range(len(sel)):
+                for j in range(i + 1, len(sel)):
+                    (p1, s1, u1, n1), (p2, s2, u2, n2) = sel[i], sel[j]
+                    ok, msg = api_post(s1, SOCIAL_URL["friend"] % u2)
+                    time.sleep(1.5)
+                    if ok:
+                        ok, msg = api_post(s2, SOCIAL_URL["accept"] % u1, {})
+                        time.sleep(1.5)
+                    rows.append((p1 + " ↔ " + p2, hide_name(n1) + " ↔ " + hide_name(n2), ok, msg))
+            show_social(rows)
+            pause()
+
+
 def menu_cookie_pull(cfg):
     if not ENV.root:
         say("Pulling cookies from the apps requires root", "yellow")
@@ -2659,7 +2818,7 @@ def menu_webhook(cfg, hook):
 
 MENU = [("1", "Start auto-rejoin"), ("2", "Show instances / status"),
         ("3", "Settings (game link, check interval, launch delay)"), ("4", "Scan packages"),
-        ("5", "Cookies (login / pull from the Roblox app)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("0", "Exit")]
+        ("5", "Cookies (login / pull from the Roblox app)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("8", "Block / unblock / add friend (with cookies)"), ("0", "Exit")]
 
 
 def main():
@@ -2703,6 +2862,8 @@ def main():
             menu_auto(cfg)
         elif c == "7":
             menu_webhook(cfg, hook)
+        elif c == "8":
+            menu_social(cfg)
         elif c == "0":
             say("Goodbye!", "cyan")
             return
