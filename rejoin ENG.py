@@ -46,7 +46,8 @@ except ImportError as _e:
     print("Required library not found: %s\nRun: pip install -r requirements.txt" % _e)
     sys.exit(1)
 
-VERSION = "1.6"
+VERSION = "1.7"
+FPS_CAP_MIN, FPS_CAP_MAX = 5, 240
 TERMUX = "/data/data/com.termux/files"
 LOGO = r"""
   ____    _    ____  _   _ _____
@@ -131,6 +132,14 @@ def hide_name(name):
     return name[:4] + "#" * (len(name) - 4)
 
 
+def hide_id(uid):
+    """Roblox user ID on screen: first 3 digits stay visible in streamer mode."""
+    uid = str(uid or "")
+    if not STREAMER["on"] or len(uid) <= 3:
+        return uid
+    return uid[:3] + "#" * (len(uid) - 3)
+
+
 def hide_users(text):
     if not STREAMER["on"]:
         return text
@@ -163,7 +172,10 @@ DEFAULTS = {
     "game_link": "",
     "check_interval": 30,
     "launch_delay": 15,
+    "block_gap_sec": 20,   # social menu item 5: min seconds between two blocks from the SAME account (Roblox ~3/min per cookie)
+    "open_all_delay": 10,   # main menu 9: seconds between opening each Roblox instance
     "package_prefix": "com.roblox.",
+    "extra_prefixes": ["aya."],   # also scanned / protected / checked exactly like package_prefix
     "packages": [],          # empty = run every detected package
     "detected": [],
     "backoff_base": 10,
@@ -181,7 +193,8 @@ DEFAULTS = {
         "presence_check": True,
         "timed_rejoin_min": 0,
     },
-    "heartbeat": {"enabled": True, "port": 8765, "interval": 15, "timeout": 90, "show_fps": True},
+    "heartbeat": {"enabled": True, "port": 8765, "interval": 15, "timeout": 90, "show_fps": True,
+                  "fps_cap": {"default": 0, "accounts": {}}},   # accounts: {"<Roblox UserId>": {"name": ..., "cap": N}}; default 0 = leave FPS alone
     "autoexec": {"auto_create": True, "enabled_once": False, "filename": "heartbeat.lua",
                  "dirs": ["/storage/emulated/0/Delta/Autoexecute"]},   # {pkg} in a path = one folder per clone
     "performance": {"low_cpu": True, "ui_refresh_sec": 2},
@@ -190,6 +203,7 @@ DEFAULTS = {
     "dialog_detect": {"enabled": True, "every_sec": 30, "confirm": 2},
     "screen_guard": {"enabled": True, "check_sec": 60, "fix_stacked": True, "kill_stray": False,
                      "keep": ["com.termux", "com.android.systemui", "com.topjohnwu.magisk"]},
+    "arrange": {"enabled": True, "cols": 0, "gap": 6, "settle_sec": 12},   # tile the game windows (root, freeform windows)
     "ram": {"enabled": True, "interval_min": 30, "min_free_mb": 300, "kill_cached": False,
             "kill_others": False, "protect": ["termux", "magisk", "delta"]},
     "webhook": {
@@ -436,7 +450,7 @@ def kill_others(cfg):
         raise RuntimeError("cannot list processes")
     running = {p.split(":")[0] for p in snap["procs"]}
     # termux/root managers are ALWAYS protected, whatever the user types in the protect list
-    prot = ([x.strip().lower() for x in r["protect"] if x.strip()] + [cfg.d["package_prefix"].lower(),
+    prot = ([x.strip().lower() for x in r["protect"] if x.strip()] + [x.lower() for x in prefixes(cfg)] + [
                                                                       "termux", "magisk", "kernelsu", "supersu"])
     keep = set(cfg.d["detected"]) | set(cfg.d["screen_guard"]["keep"]) | {home_pkg()}
     victims = [p for p in sorted(third & running) if p not in keep and not any(x in p.lower() for x in prot)]
@@ -449,7 +463,7 @@ def drop_ram(kill_cached=False, cfg=None):
     """Root only. Drop page cache (and optionally kill cached background apps).
     -> (ok, before_mb, after_mb); a per-step report is left in RAM_LAST["detail"]."""
     if not ENV.root:
-        RAM_LAST["detail"] = "Root required"
+        RAM_LAST["detail"] = "root required"
         return False, None, None
     before = mem_available_mb()
     steps = []
@@ -562,7 +576,7 @@ def detect_screen_dialog():
     data = sh_bytes("screencap", root=True)
     fr = parse_raw_frame(data)
     if not fr or fr[2] not in (1, 2, 5):
-        return None, "Could not read the screen capture"
+        return None, "cannot read the screenshot"
     w, h, fmt, off = fr
     return find_disconnect_dialog(data, w, h, off), "%dx%d format=%d" % (w, h, fmt)
 
@@ -615,25 +629,95 @@ def home_pkg():
     return cached("home", 3600, run)
 
 
+def grid_rects(n, w, h, cols=0, gap=6):
+    """n equal tiles (left, top, right, bottom) in row-major order. cols=0 -> pick the grid closest to the screen shape."""
+    if n <= 0 or w <= 0 or h <= 0:
+        return []
+    if cols <= 0:
+        cols = max(1, min(n, int(round((n * w / float(h)) ** 0.5))))
+    cols = min(cols, n)
+    rows = -(-n // cols)
+    cw, ch = (w - gap * (cols + 1)) // cols, (h - gap * (rows + 1)) // rows
+    out = []
+    for i in range(n):
+        r, c = divmod(i, cols)
+        l, t = gap + c * (cw + gap), gap + r * (ch + gap)
+        out.append((l, t, l + cw, t + ch))
+    return out
+
+
+def display_size():
+    """Current display size (rotation included). Root. -> (w, h) or (0, 0)"""
+    _, o = sh("dumpsys window displays 2>/dev/null | grep -m1 -E 'cur=[0-9]+x[0-9]+'", root=True, timeout=15)
+    m = re.search(r"cur=(\d+)x(\d+)", o)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    _, o = sh("wm size", root=True, timeout=10)
+    m = re.findall(r"(\d+)x(\d+)", o)
+    return (int(m[-1][0]), int(m[-1][1])) if m else (0, 0)
+
+
+def parse_task_ids(out):
+    """dumpsys task lines -> {package: [task ids, top-most first]}"""
+    tasks = {}
+    for l in out.splitlines():
+        m, t = re.search(r"\bA=(?:\d+:)?([\w.]+)", l), re.search(r"#(\d+)", l)
+        if m and t:
+            ids = tasks.setdefault(m.group(1), [])
+            if t.group(1) not in ids:
+                ids.append(t.group(1))
+    return tasks
+
+
+def arrange_windows(cfg, pkgs):
+    """Tile the game windows of `pkgs` (in order) across the screen with `am task resize`. -> (ok, message)"""
+    if not ENV.root:
+        return False, "root required"
+    a = cfg.d["arrange"]
+    w, h = display_size()
+    if not (w and h):
+        return False, "cannot read the screen size"
+    _, o = sh(r"dumpsys activity activities 2>/dev/null | grep -E '\* (Task|TaskRecord)\{'", root=True, timeout=40)
+    tasks = parse_task_ids(o)
+    present = [p for p in pkgs if tasks.get(p)]
+    if not present:
+        return False, "instance window not found (game not open?)"
+    rects = grid_rects(len(present), w, h, int(a["cols"]), int(a["gap"]))
+    am, done, bad = AM(), 0, []
+    for p, (l, t, r, b) in zip(present, rects):
+        tid = tasks[p][0]
+        sh("%s task resizeable %s 3 2>/dev/null" % (am, tid), root=True, timeout=15)
+        rc, out = sh("%s task resize %s %d %d %d %d 2>&1" % (am, tid, l, t, r, b), root=True, timeout=15)
+        if rc == 0 and not re.search(r"exception|error|unknown|not found|invalid", out, re.I):
+            done += 1
+        else:
+            bad.append(p)
+    cols = max(1, min(len(present), int(a["cols"]) or int(round((len(present) * w / float(h)) ** 0.5))))
+    msg = "%d windows (%d columns) screen %dx%d" % (done, cols, w, h)
+    if bad:
+        msg += " | failed: " + ", ".join(bad)
+    return done > 0, msg
+
+
 def screen_scan(cfg):
     _, out = sh(GUARD_CMD, root=True, timeout=40)
-    return parse_guard(out, cfg.d["package_prefix"])
+    return parse_guard(out, prefixes(cfg))
 
 
 def stray_pkg(cfg, info):
     g, top = cfg.d["screen_guard"], info["top"]
     if not (g["kill_stray"] and top):
         return ""
-    if top.startswith(cfg.d["package_prefix"]) or top in g["keep"] or top == home_pkg():
+    if top.startswith(prefixes(cfg)) or top in g["keep"] or top == home_pkg():
         return ""
     return top
 
 
 def screen_clear(cfg, info, force_all=False):
-    """Close system dialogs and force-stop apps causing stacked/overlapping windows. -> list of action descriptions."""
-    g, prefix, q = cfg.d["screen_guard"], cfg.d["package_prefix"], shlex.quote
+    """Close system dialogs and force-stop apps causing stacked/overlapping windows. -> list of actions (Thai)."""
+    g, prefix, q = cfg.d["screen_guard"], prefixes(cfg), shlex.quote
     sh(AM() + " broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS", root=True, timeout=20)
-    acts = ["Closed system dialogs"]
+    acts = ["closed system dialog"]
     for p in sorted(info["dialogs"]):
         if p != "?" and (p.startswith(prefix) or (g["kill_stray"] and p not in g["keep"])):
             sh(AM() + " force-stop " + q(p), root=True, timeout=20)
@@ -641,7 +725,7 @@ def screen_clear(cfg, info, force_all=False):
     if g["fix_stacked"] or force_all:
         for p in info["stacked"]:
             sh(AM() + " force-stop " + q(p), root=True, timeout=20)
-            acts.append("force-stop %s (stacked window)" % p)
+            acts.append("force-stop %s (stacked windows)" % p)
     sp = stray_pkg(cfg, info)
     if sp:
         sh(AM() + " force-stop " + q(sp), root=True, timeout=20)
@@ -675,6 +759,12 @@ def wake_lock(on):
 
 
 # ----------------------------------------------------------------- packages / links
+def prefixes(cfg):
+    """package_prefix + extra_prefixes (e.g. 'aya.') as a tuple that str.startswith accepts."""
+    out = [cfg.d["package_prefix"]] + list(cfg.d.get("extra_prefixes") or [])
+    return tuple(dict.fromkeys(x.strip() for x in out if isinstance(x, str) and x.strip()))
+
+
 def scan_packages(prefix):
     out = ""
     for root in ((True, False) if ENV.root else (False,)):
@@ -692,7 +782,8 @@ def scan_packages(prefix):
             name = line.split(":", 1)[1].strip()
             if name.startswith(prefix):
                 pk.add(name)
-    return sorted(pk, key=lambda p: (p != "com.roblox.client", p))
+    main = prefix[0] if isinstance(prefix, tuple) else prefix   # main prefix first, so existing cookie order is kept
+    return sorted(pk, key=lambda p: (p != "com.roblox.client", not p.startswith(main), p))
 
 
 def parse_link(link):
@@ -726,7 +817,7 @@ def open_game(pkg, uri, force_stop):
         rc, out2 = sh("monkey -p %s -c android.intent.category.LAUNCHER 1" % q(pkg), root=ENV.root, timeout=30)
         if rc != 0:
             return False, scrub((out + out2).strip()[:200])
-        return True, "App opened but the game link did not work (used launcher instead)"
+        return True, "app opened but the game link did not work (used the launcher instead)"
     return True, "ok"
 
 
@@ -755,10 +846,10 @@ def prune_shots():
 # ----------------------------------------------------------------- cookies / roblox api
 COOKIE_TEMPLATE = (
     "# GARNT TOOL REJOIN - cookie.txt\n"
-    "# Put the .ROBLOSECURITY cookie of your own accounts here, 1 line per account\n"
-    "# Order follows the detected instances (first line = first package). Never share this file\n"
+    "# Put your own .ROBLOSECURITY cookie here, 1 line per account\n"
+    "# In the order of the detected instances (line 1 = first package). Never share this file.\n"
     "# Blank lines and lines starting with # are skipped\n"
-    "# A line with just - = no cookie for that instance (keeps the order)\n"
+    "# A line with only - means that instance has no cookie yet (keeps the order)\n"
 )
 
 
@@ -815,7 +906,7 @@ def who_am_i(s):
     try:
         r = s.get("https://users.roblox.com/v1/users/authenticated", timeout=12)
         if r.status_code == 401:
-            return None, None, "Cookie expired/invalid"
+            return None, None, "cookie expired/invalid"
         if r.status_code != 200:
             return None, None, "HTTP %d" % r.status_code
         j = r.json()
@@ -879,28 +970,28 @@ def _edit_cookie_db(dbfile, cookie):
 def inject_cookie(pkg, cookie):
     """Root only: write .ROBLOSECURITY into the cloned app's WebView cookie DB."""
     if not ENV.root:
-        return False, "Root access required"
+        return False, "root required"
     q = shlex.quote
     _, out = sh("find /data/data/%s -maxdepth 4 -type f -name Cookies 2>/dev/null | head -n 1" % q(pkg), root=True)
     path = out.strip().splitlines()[0].strip() if out.strip() else ""
     if not path:
-        return False, "Cookie database not found (open the app once and leave it running)"
+        return False, "cookie database not found (open the app once first)"
     _, own = sh("stat -c '%%u:%%g' /data/data/%s" % q(pkg), root=True)
     own = own.strip()
     if not re.fullmatch(r"\d+:\d+", own):
-        return False, "Could not read the app folder owner"
+        return False, "cannot read the app folder owner"
     sh(AM() + " force-stop " + q(pkg), root=True)
     tmp = os.path.join(TMP_DIR, "garnt_%s.db" % pkg.replace(".", "_"))
     try:
         rc, o = sh("cp %s %s && chmod 666 %s" % (q(path), q(tmp), q(tmp)), root=True)
         if rc != 0:
-            return False, "Failed to copy the database"
+            return False, "failed to copy the database"
         _edit_cookie_db(tmp, cookie)
         rc, o = sh("cp %s %s && chown %s %s && chmod 660 %s" % (q(tmp), q(path), own, q(path), q(path)), root=True)
         if rc != 0:
-            return False, "Failed to write the database back"
+            return False, "failed to write the database back"
         sh("rm -f %s-journal %s-wal %s-shm; restorecon %s" % (q(path), q(path), q(path), q(path)), root=True)
-        return True, "Cookie injected"
+        return True, "cookie injected"
     except Exception as e:
         return False, scrub(e)[:100]
     finally:
@@ -915,7 +1006,7 @@ def cookie_login(pairs):
     for pkg, ck in pairs:
         uid, name, err = who_am_i(make_session(ck))
         if not uid:
-            res.append((pkg, False, "Cookie unusable: %s" % err))
+            res.append((pkg, False, "cookie unusable: %s" % err))
             continue
         ok, msg = inject_cookie(pkg, ck)
         res.append((pkg, ok, ("%s: %s" % (hide_name(name), msg)) if ok else msg))
@@ -931,16 +1022,16 @@ def read_app_cookie(pkg):
     """Root only: read .ROBLOSECURITY from the clone's WebView cookie DB (works on a copy, never edits the app).
     -> (cookie | None, message)"""
     if not ENV.root:
-        return None, "Root required"
+        return None, "root required"
     path = find_cookie_db(pkg)
     if not path:
-        return None, "Cookie database not found (open the app once first)"
+        return None, "cookie database not found (open the app once first)"
     tmpd = tempfile.mkdtemp(prefix="garnt_", dir=TMP_DIR)
     try:
         s, t = shlex.quote(path), shlex.quote(tmpd)
         rc, _ = sh("cp %s %s/ && chmod -R a+rw %s" % (s, t, t), root=True)
         if rc != 0:
-            return None, "Could not copy the database"
+            return None, "failed to copy the database"
         sh("cp %s-wal %s-shm %s-journal %s/ 2>/dev/null; chmod -R a+rw %s" % (s, s, s, t, t), root=True)
         con = sqlite3.connect(os.path.join(tmpd, os.path.basename(path)), timeout=10)
         try:
@@ -959,8 +1050,8 @@ def read_app_cookie(pkg):
                 SECRETS.add(ck)
                 return ck, "ok"
         if any(enc for _, enc in rows):
-            return None, "The cookie in the app is encrypted and cannot be read"
-        return None, "No cookie found (this app is not logged in)"
+            return None, "the cookie in the app is encrypted and cannot be read"
+        return None, "no cookie found (not logged in to this app yet)"
     except Exception as e:
         return None, scrub(e)[:100]
     finally:
@@ -979,7 +1070,7 @@ def pull_validated(pkgs):
         if uid:
             out.append((pkg, ck, name, ""))
         else:
-            out.append((pkg, None, None, "The cookie in the app is not usable: " + str(err)))
+            out.append((pkg, None, None, "the cookie in the app is unusable: " + str(err)))
     return out
 
 
@@ -1068,11 +1159,15 @@ class Hook:
 
 # ----------------------------------------------------------------- heartbeat (in-game script -> local receiver)
 LUA_TEMPLATE = r"""-- GARNT TOOL REJOIN heartbeat (auto-generated)
--- For your own accounts and devices only. Must run through an executor that supports HTTP
+-- For your own accounts and device only. Must run in an executor that supports HTTP
 local HOST     = "http://127.0.0.1:__PORT__"
-local ID       = "__ID__"       -- package name or instance number; must match the tool
+local ID       = "__ID__"       -- package name or instance number, must match the tool
 local INTERVAL = __INTERVAL__   -- send every N seconds
-local SHOW_FPS = __SHOWFPS__    -- true = show the draggable FPS box on screen
+local SHOW_FPS = __SHOWFPS__    -- true = show the FPS number on screen (draggable)
+local DEFAULT_CAP = __DEFCAP__  -- FPS cap for accounts not in the list (0 = leave FPS alone)
+local CAPS = {                  -- FPS cap per account: [Roblox UserId] = FPS (set from the tool's menu)
+__CAPS__
+}
 
 if getgenv then
     if getgenv().__GARNT_HB then return end
@@ -1088,6 +1183,15 @@ local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
 while not lp do task.wait(1); lp = Players.LocalPlayer end
+
+-- FPS cap: look up the UserId of the account that is playing and apply its cap (executor must have setfpscap)
+local function applyCap()
+    local cap = CAPS[lp.UserId] or DEFAULT_CAP
+    if type(cap) ~= "number" or cap <= 0 then return end
+    local fn = setfpscap or set_fps_cap or (getgenv and getgenv().setfpscap)
+    if fn then pcall(fn, cap) end
+end
+pcall(applyCap)
 
 local lastFrame = os.clock()
 local frames, fps, winStart = 0, 0, os.clock()
@@ -1121,7 +1225,7 @@ local function beat()
     local url = string.format("%s/hb?id=%s&user=%s&uid=%d&place=%d&job=%s&fps=%d", HOST,
         HttpService:UrlEncode(ID), HttpService:UrlEncode(lp.Name), lp.UserId, game.PlaceId,
         HttpService:UrlEncode(game.JobId), fps)
-    local err = errorText()                          -- Disconnected prompt showing: send the error text immediately
+    local err = errorText()                          -- Disconnected dialog showing: send the error text right away
     if err then url = url .. "&err=" .. HttpService:UrlEncode(string.sub(err, 1, 120)) end
     httpGet(url)
 end
@@ -1130,12 +1234,14 @@ pcall(function() GuiService.ErrorMessageChanged:Connect(function() pcall(beat) e
 
 task.spawn(function()
     while true do
+        pcall(applyCap)                              -- re-apply every round in case the game/executor resets it
         pcall(beat)
         task.wait(INTERVAL)
     end
 end)
 
--- FPS box: black fill, white border, drag it anywhere (position is remembered if the executor supports writefile)
+-- FPS number: no frame, round font, size follows the screen width automatically, draggable anywhere
+-- (position is remembered if the executor supports writefile)
 local POS_FILE = "garnt_fps_pos.txt"
 
 local function parentGui(gui)
@@ -1165,6 +1271,14 @@ local function savePos(x, y)
     if writefile then pcall(writefile, POS_FILE, string.format("%d,%d", x, y)) end
 end
 
+local function roundFont()
+    for _, name in ipairs({ "FredokaOne", "Nunito", "GothamBold" }) do   -- round fonts first, fall back to the next one
+        local ok, f = pcall(function() return Enum.Font[name] end)
+        if ok and f then return f end
+    end
+    return Enum.Font.SourceSansBold
+end
+
 local function buildFpsBox()
     local gui = Instance.new("ScreenGui")
     gui.Name = "GARNT_FPS"
@@ -1173,45 +1287,63 @@ local function buildFpsBox()
     gui.DisplayOrder = 999999
     if not parentGui(gui) then return end
 
-    local W, H = 104, 34
     local box = Instance.new("Frame")
     box.Name = "Box"
-    box.Size = UDim2.fromOffset(W, H)
-    box.BackgroundColor3 = Color3.fromRGB(0, 0, 0)       -- black fill
-    box.BackgroundTransparency = 0
+    box.BackgroundColor3 = Color3.fromRGB(0, 0, 0)       -- black background, no border
+    box.BackgroundTransparency = 0.25
     box.BorderSizePixel = 0
     box.Active = true
     box.Parent = gui
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
+    corner.CornerRadius = UDim.new(1, 0)                 -- fully rounded
     corner.Parent = box
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(255, 255, 255)         -- white border
-    stroke.Thickness = 2
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.Parent = box
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Size = UDim2.new(1, 0, 1, 0)
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 18
+    label.Font = roundFont()
+    label.TextScaled = true
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.Text = "FPS --"
     label.Parent = box
 
-    local function clamp(x, y)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0.12, 0)
+    pad.PaddingRight = UDim.new(0.12, 0)
+    pad.PaddingTop = UDim.new(0.14, 0)
+    pad.PaddingBottom = UDim.new(0.14, 0)
+    pad.Parent = label
+
+    local W, H = 72, 28
+    local function viewport()
         local cam = workspace.CurrentCamera
-        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        return (cam and cam.ViewportSize) or Vector2.new(800, 600)
+    end
+
+    local function clamp(x, y)
+        local vp = viewport()
         return math.clamp(x, 0, math.max(0, vp.X - W)), math.clamp(y, 0, math.max(0, vp.Y - H))
+    end
+
+    local function layout()                              -- size follows the screen width: compact but readable
+        local vp = viewport()
+        W = math.clamp(math.floor(vp.X * 0.055), 56, 110)
+        H = math.floor(W * 0.4)
+        box.Size = UDim2.fromOffset(W, H)
+        local x, y = clamp(box.Position.X.Offset, box.Position.Y.Offset)
+        box.Position = UDim2.fromOffset(x, y)
     end
 
     local sx, sy = loadPos()
     if not sx then sx, sy = 12, 64 end
-    sx, sy = clamp(sx, sy)
     box.Position = UDim2.fromOffset(sx, sy)
+    layout()
+
+    local cam = workspace.CurrentCamera
+    if cam then
+        cam:GetPropertyChangedSignal("ViewportSize"):Connect(function() pcall(layout) end)   -- rotation / window resize
+    end
 
     local dragging, dragStart, startX, startY = false, nil, 0, 0
     box.InputBegan:Connect(function(input)
@@ -1249,9 +1381,30 @@ end
 """
 
 
-def render_lua(inst_id, port, interval, show_fps=True):
+def fps_caps(cfg):
+    """-> (default_cap, {uid: cap}) from config; invalid entries are dropped."""
+    fc = cfg.d["heartbeat"].get("fps_cap", {})
+    try:
+        default = max(0, min(int(fc.get("default", 0)), FPS_CAP_MAX))
+    except (TypeError, ValueError):
+        default = 0
+    caps = {}
+    for uid, rec in (fc.get("accounts") or {}).items():
+        try:
+            cap = int(rec.get("cap", 0) if isinstance(rec, dict) else rec)
+            if str(uid).isdigit() and FPS_CAP_MIN <= cap <= FPS_CAP_MAX:
+                caps[int(uid)] = cap
+        except (TypeError, ValueError):
+            continue
+    return default, caps
+
+
+def render_lua(inst_id, port, interval, show_fps=True, default_cap=0, caps=None):
+    rows = ",\n".join("    [%d] = %d" % (u, c) for u, c in sorted((caps or {}).items()))
     return (LUA_TEMPLATE.replace("__PORT__", str(int(port))).replace("__INTERVAL__", str(int(interval)))
             .replace("__SHOWFPS__", "true" if show_fps else "false")
+            .replace("__DEFCAP__", str(int(default_cap)))
+            .replace("__CAPS__", rows + ("," if rows else ""))
             .replace("__ID__", re.sub(r"[^\w.\-]", "", str(inst_id))))
 
 
@@ -1264,7 +1417,7 @@ def write_heartbeat_files(cfg):
     for i, pkg in enumerate(det, 1):
         p = os.path.join(d, "heartbeat_%d_%s.lua" % (i, pkg.split(".")[-1]))
         with open(p, "w", encoding="utf-8") as f:
-            f.write(render_lua(pkg, h["port"], h["interval"], h.get("show_fps", True)))
+            f.write(render_lua(pkg, h["port"], h["interval"], h.get("show_fps", True), *fps_caps(cfg)))
         paths.append(p)
     return paths
 
@@ -1316,7 +1469,7 @@ def install_autoexec(cfg):
     res = []
     for d, ident in autoexec_targets(cfg):
         path = os.path.join(d, a["filename"])
-        src = render_lua(ident, h["port"], h["interval"], h.get("show_fps", True))
+        src = render_lua(ident, h["port"], h["interval"], h.get("show_fps", True), *fps_caps(cfg))
         try:
             old = None
             if os.path.exists(path):
@@ -1338,8 +1491,8 @@ def install_autoexec(cfg):
 
 
 def report_autoexec(cfg, results, quiet_ok=True):
-    names = {"created": "Created", "updated": "Updated", "ok": "Ready",
-             "skipped": "Skipped (a same-name file not made by this tool exists)"}
+    names = {"created": "created", "updated": "updated", "ok": "up to date",
+             "skipped": "skipped (a file with the same name that is not the tool's)"}
     for path, st in results:
         if st == "ok" and quiet_ok:
             continue
@@ -1348,7 +1501,7 @@ def report_autoexec(cfg, results, quiet_ok=True):
         cfg.d["autoexec"]["enabled_once"] = True
         cfg.d["heartbeat"]["enabled"] = True       # first install only: turn heartbeat on (later changes are yours)
         cfg.save()
-        say("Heartbeat enabled for you (turn it off at Menu 6 > Heartbeat > 1)", "cyan")
+        say("heartbeat enabled for you (turn it off at Menu 6 > Heartbeat > 1)", "cyan")
 
 
 class Heartbeats:
@@ -1576,7 +1729,7 @@ def sys_load():
         return None
 
 
-CONSOLE_HELP = ("Commands: rejoin <n|all> | pause <n|all> | resume <n|all> | status | ram | shot | clear | streamer | help | quit")
+CONSOLE_HELP = ("Commands: rejoin <number|all> | pause <number|all> | resume <number|all> | status | ram | shot | clear | arrange | streamer | help | quit")
 
 
 # ----------------------------------------------------------------- engine
@@ -1599,14 +1752,14 @@ class Inst:
         self.started_at = time.time()
 
 
-REASON = {"dead": "App closed/frozen (process not found)", "background": "App is not in the foreground",
-          "noheartbeat": "No heartbeat from the in-game script",
-          "disconnected": "Disconnected prompt detected (e.g. Error Code 277)",
-          "notingame": "Not in a game", "timed": "Timed rejoin (as configured)"}
-STATE_LABEL = {"queued": ("Queued", "dim"), "launching": ("Launching app", "cyan"),
-            "joining": ("Joining game", "yellow"), "ok": ("OK", "bold green"),
-            "unknown": ("Unknown", "magenta"), "backoff": ("Waiting to rejoin", "bold red"),
-            "stopped": ("Stopped", "dim"), "paused": ("Paused", "yellow")}
+REASON = {"dead": "app closed/frozen (process not found)", "background": "app is not on screen",
+          "noheartbeat": "no heartbeat from the in-game script",
+          "disconnected": "Disconnected dialog found (e.g. Error Code 277)",
+          "notingame": "not in the game", "timed": "timed rejoin"}
+STATE_LABEL = {"queued": ("queued", "dim"), "launching": ("launching", "cyan"),
+            "joining": ("joining", "yellow"), "ok": ("OK", "bold green"),
+            "unknown": ("unknown", "magenta"), "backoff": ("waiting to rejoin", "bold red"),
+            "stopped": ("stopped", "dim"), "paused": ("paused", "yellow")}
 
 
 def fmt_dur(sec):
@@ -1624,6 +1777,7 @@ class Engine:
         self.stop = threading.Event()
         self.gate = threading.Lock()
         self.last_launch = 0.0
+        self._arr_timer, self._arr_lock = None, threading.Lock()
         self.events = deque(maxlen=10)
         self._dlg_n = 0
         self._stack_seen, self._stack_last = {}, {}
@@ -1643,10 +1797,10 @@ class Engine:
         return max(10, int(self.cfg.d["check_interval"]))
 
     def start(self):
-        self.event("Started %d instance(s) (mode %s)" % (len(self.insts), "ROOT" if ENV.root else "non-root"), "green")
-        self.hook.send("start", "▶️ Auto-rejoin started", "Managing %d instance(s)" % len(self.insts),
+        self.event("Started %d instances (mode %s)" % (len(self.insts), "ROOT" if ENV.root else "non-root"), "green")
+        self.hook.send("start", "▶️ Auto rejoin started", "Managing %d instances" % len(self.insts),
                        [("Mode", "ROOT" if ENV.root else "non-root"), ("Check every", "%ds" % self.interval()),
-                        ("Package", ", ".join(i.pkg for i in self.insts))])
+                        ("Packages", ", ".join(i.pkg for i in self.insts))])
         SNAP["fg"] = bool(ENV.root and (self.cfg.d["auto"]["foreground_check"] or self.cfg.d["dialog_detect"]["enabled"]))
         for target, args in [(self._worker, (i,)) for i in self.insts] + [(self._housekeeper, ())]:
             t = threading.Thread(target=target, args=args, daemon=True)
@@ -1663,8 +1817,8 @@ class Engine:
         SNAP["fg"] = False
         up = fmt_dur(time.time() - self.t0)
         self.event("Stopped (ran for %s)" % up)
-        self.hook.send("stop", "⏹️ Auto-rejoin stopped", "Ran for " + up,
-                       [(i.pkg, "Rejoined %d time(s)" % i.rejoins) for i in self.insts], sync=True)
+        self.hook.send("stop", "⏹️ Auto rejoin stopped", "Ran for " + up,
+                       [(i.pkg, "%d rejoins" % i.rejoins) for i in self.insts], sync=True)
 
     def _next_tick(self):
         """All instances are checked on the same time grid so one snapshot serves every instance."""
@@ -1691,14 +1845,38 @@ class Engine:
                 try:
                     self.guard_tick()
                 except Exception as e:
-                    self.event("Stacked-window clear failed: %s" % e, "red")
+                    self.event("Stacked-window cleanup error: %s" % e, "red")
             pm = int(c["webhook"]["periodic_min"])
             if pm > 0 and now - last_rep >= pm * self.MIN:
                 last_rep = now
                 try:
                     self.report(pm)
                 except Exception as e:
-                    self.event("Failed to send status report: %s" % e, "red")
+                    self.event("Status report failed: %s" % e, "red")
+
+    def _arrange_later(self):
+        """After a launch/rejoin: tile the windows once the new one has appeared (debounced; every launch restarts the wait)."""
+        a = self.cfg.d["arrange"]
+        if not (a["enabled"] and ENV.root):
+            return
+        with self._arr_lock:
+            if self._arr_timer:
+                self._arr_timer.cancel()
+            self._arr_timer = threading.Timer(max(3, int(a["settle_sec"])), self._arrange_fire)
+            self._arr_timer.daemon = True
+            self._arr_timer.start()
+
+    def _arrange_fire(self):
+        if self.stop.is_set():
+            return
+        try:
+            self.arrange_now("auto")
+        except Exception as e:
+            self.event("Window arrange error: %s" % e, "red")
+
+    def arrange_now(self, why):
+        ok, msg = arrange_windows(self.cfg, [i.pkg for i in self.insts])
+        self.event("Arrange windows (%s): " % why + msg, "cyan" if ok else "yellow")
 
     def guard_tick(self):
         """Clear stacked/overlapping windows: error dialogs, duplicate tasks (debounced), stray apps on top."""
@@ -1717,14 +1895,14 @@ class Engine:
                 self._stack_last[p] = now
         info["stacked"] = confirmed
         if info["dialogs"] or confirmed or stray_pkg(self.cfg, info):
-            self.event("Cleared stacked windows: " + ", ".join(screen_clear(self.cfg, info)), "yellow")
+            self.event("Stacked-window cleanup: " + ", ".join(screen_clear(self.cfg, info)), "yellow")
 
     def clear_ram(self, why):
         ok, before, after = drop_ram(self.cfg.d["ram"]["kill_cached"], self.cfg)
         if ok:
-            self.event("RAM cleared (%s): free %s → %s MB | %s" % (why, before, after, RAM_LAST["detail"]), "cyan")
+            self.event("RAM cleanup (%s): free %s → %s MB | %s" % (why, before, after, RAM_LAST["detail"]), "cyan")
         else:
-            self.event("RAM clear failed: %s" % RAM_LAST["detail"], "red")
+            self.event("RAM cleanup failed: %s" % RAM_LAST["detail"], "red")
 
     def _fps_txt(self, inst):
         rec = self.hb.latest(inst) if self.hb else None
@@ -1739,7 +1917,7 @@ class Engine:
         if shot is None and minutes is not None and ENV.root and w["send_screenshot"]:
             shot = take_shot("status")
         mem = mem_available_mb()
-        fields = [(i.label, "%s | rejoins %d | fails %d%s" % (STATE_LABEL.get(i.state, (i.state,))[0], i.rejoins, i.fails,
+        fields = [(i.label, "%s | rejoins %d | failures %d%s" % (STATE_LABEL.get(i.state, (i.state,))[0], i.rejoins, i.fails,
                                                               (" | " + i.user) if i.user else "") + self._fps_txt(i)) for i in self.insts][:22]
         fields.append(("Free RAM", ("%d MB" % mem) if mem is not None else "-"))
         fields.append(("Uptime", fmt_dur(time.time() - self.t0)))
@@ -1755,7 +1933,7 @@ class Engine:
     def _manual(self, inst):
         cmd = self._take_cmd(inst)
         if cmd == "pause":
-            inst.paused, inst.state, inst.detail = True, "paused", "Paused by command (type resume)"
+            inst.paused, inst.state, inst.detail = True, "paused", "paused by command (type resume)"
             self.event("%s: paused" % inst.label, "yellow")
         elif cmd in ("rejoin", "resume"):
             inst.paused, inst.fails, inst.ok_since = False, 0, None
@@ -1787,7 +1965,7 @@ class Engine:
                 for i in ts:
                     i.cmd = act
                     i.wake.set()
-                self.event("Ran %s on instance %s" % (act, ", ".join(str(i.idx) for i in ts)), "cyan")
+                self.event("%s instances %s" % (act, ", ".join(str(i.idx) for i in ts)), "cyan")
         elif cmd == "status":
             for i in self.insts:
                 self.event("#%d %s | %s" % (i.idx, STATE_LABEL.get(i.state, (i.state,))[0], i.detail or "-"))
@@ -1795,10 +1973,10 @@ class Engine:
             on = (not STREAMER["on"]) if not args else args[0] in ("on", "1", "yes", "y")
             STREAMER["on"] = self.cfg.d["ui"]["streamer_mode"] = on
             self.cfg.save()
-            self.event("Streamer mode (hide account names): " + ("ON" if on else "OFF"), "cyan")
-        elif cmd in ("ram", "shot", "clear"):
+            self.event("Hide account names (streamer): " + ("on" if on else "off"), "cyan")
+        elif cmd in ("ram", "shot", "clear", "arrange"):
             if not ENV.root:
-                self.event("Command %s requires root" % cmd, "red")
+                self.event("Command %s needs root" % cmd, "red")
             else:
                 threading.Thread(target=self._cmd_root, args=(cmd,), daemon=True).start()
         else:
@@ -1808,12 +1986,14 @@ class Engine:
     def _cmd_root(self, cmd):
         try:
             if cmd == "ram":
-                self.clear_ram("Command")
+                self.clear_ram("command")
+            elif cmd == "arrange":
+                self.arrange_now("command")
             elif cmd == "clear":
-                self.event("Screen cleared: " + ", ".join(screen_clear(self.cfg, screen_scan(self.cfg), force_all=True)), "yellow")
+                self.event("Screen cleanup: " + ", ".join(screen_clear(self.cfg, screen_scan(self.cfg), force_all=True)), "yellow")
             else:
                 path = take_shot("console")
-                self.event("Screenshot saved: %s" % os.path.basename(path) if path else "Screenshot failed", "cyan" if path else "red")
+                self.event("Saved screenshot: %s" % os.path.basename(path) if path else "Screenshot failed", "cyan" if path else "red")
                 if path:
                     self.report(None, shot=path)
         except Exception as e:
@@ -1842,7 +2022,7 @@ class Engine:
 
     def _launch(self, inst, kind, force=False):
         c = self.cfg.d
-        inst.state, inst.detail = "queued", "Waiting in launch queue"
+        inst.state, inst.detail = "queued", "waiting for launch slot"
         with self.gate:
             wait = self.last_launch + max(0, int(c["launch_delay"])) - time.time()
             if wait > 0 and self.stop.wait(wait):
@@ -1853,9 +2033,10 @@ class Engine:
             ok, msg = open_game(inst.pkg, self.uri, c["auto"]["force_stop"] or force)
             self.last_launch = time.time()
         inst.launched_at = time.time()
+        self._arrange_later()
         inst.pres_at = 0.0
         inst.dlg_hits = 0
-        inst.state, inst.detail = "joining", "Waiting to join"
+        inst.state, inst.detail = "joining", "waiting to join the game"
         if not ok:
             self.event("%s: failed to open the game: %s" % (inst.label, msg), "red")
             return True
@@ -1865,7 +2046,7 @@ class Engine:
             inst.rejoins += 1
             self.event("%s: rejoined (#%d)" % (inst.label, inst.rejoins), "cyan")
             self.hook.send("rejoin", "🔁 Rejoined", inst.label,
-                           [("Package", inst.pkg), ("Account", inst.user or "-"), ("Rejoin #", str(inst.rejoins))])
+                           [("Package", inst.pkg), ("Account", inst.user or "-"), ("Count", str(inst.rejoins))])
         return True
 
     def presence(self, inst):
@@ -1876,7 +2057,7 @@ class Engine:
         if inst.uid is None:
             uid, name, err = who_am_i(inst.session)
             if not uid:
-                if err and "Cookie" in err:
+                if err and "cookie" in err.lower():
                     inst.cookie_bad = True
                     self.event("%s: %s" % (inst.label, err), "red")
                 return None
@@ -1908,7 +2089,7 @@ class Engine:
         if rec is None:
             return None  # script never reported: fall back to other signals
         if rec["ts"] < inst.launched_at:
-            return "stale", "No heartbeat since the last relaunch"
+            return "stale", "no heartbeat yet since the game was reopened"
         age = time.time() - rec["ts"]
         if rec.get("err") and age <= int(hc["timeout"]):
             return "err", "Disconnected: " + rec["err"]
@@ -1942,16 +2123,16 @@ class Engine:
             if hit and inst.dlg_hits >= int(self.cfg.d["dialog_detect"]["confirm"]):
                 return "disconnected", REASON["disconnected"]
             if hit:
-                return "ok", "Abnormal window detected, confirming %d more round(s)" % (int(self.cfg.d["dialog_detect"]["confirm"]) - inst.dlg_hits)
+                return "ok", "abnormal window found, waiting for %d more confirmation(s)" % (int(self.cfg.d["dialog_detect"]["confirm"]) - inst.dlg_hits)
         pres = self.presence(inst)
         who = (" [%s]" % inst.user) if inst.user else ""
         if pres is True:
-            return "ok", "In game" + who
+            return "ok", "in the game" + who
         if pres is False:
             return "notingame", REASON["notingame"] + who
         if alive:
-            return "ok", "App is running (no game-state info)"
-        return "unknown", "Unknown state (non-root / no cookie)"
+            return "ok", "app is running (no game status data)"
+        return "unknown", "unknown (non-root / no cookie)"
 
     def _tick(self, inst):
         c = self.cfg.d
@@ -1986,9 +2167,9 @@ class Engine:
             delay = min(int(c["backoff_max"]), int(c["backoff_base"]) * 2 ** (inst.fails - 1))
             self.event("%s: %s (#%d) rejoining in %ds" % (inst.label, REASON[reason], inst.fails, delay), "red")
             shot = take_shot(inst.pkg) if c["auto"]["screenshot_on_crash"] else None
-            self.hook.send("crash", "⚠️ Dropped / frozen", inst.label,
+            self.hook.send("crash", "⚠️ Dropped/frozen", inst.label,
                            [("Reason", REASON[reason]), ("Package", inst.pkg), ("Account", inst.user or "-"),
-                            ("Consecutive fails", str(inst.fails)), ("Rejoin in", "%ds" % delay)], shot)
+                            ("Consecutive failures", str(inst.fails)), ("Rejoin in", "%ds" % delay)], shot)
         else:
             self.event("%s: %s" % (inst.label, REASON[reason]), "cyan")
         if delay:
@@ -1997,7 +2178,7 @@ class Engine:
                 if self.stop.is_set():
                     return
                 if self._take_cmd(inst) == "pause":
-                    inst.paused, inst.state, inst.detail = True, "paused", "Paused by command (type resume)"
+                    inst.paused, inst.state, inst.detail = True, "paused", "paused by command (type resume)"
                     return
         self._launch(inst, "rejoin")
 
@@ -2012,9 +2193,9 @@ class Engine:
             ("  |  uptime " + fmt_dur(now - self.t0), "bold"),
             (("  |  free RAM %d MB" % mem) if mem is not None else "", ""),
             (("  |  load %.1f" % load) if load is not None else "", ""),
-            ("\nType a command and press Enter (help = command list) | quit or Ctrl+C = stop and return to menu", "dim"))
+            ("\nType a command and press Enter (help = command list) | quit or Ctrl+C = stop and return to the menu", "dim"))
         t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold cyan")
-        for col in ("#", "Package", "Account", "State", "Played", "Fails", "Rejoins", "Next", "Details"):
+        for col in ("#", "Package", "Account", "State", "Playing", "Failures", "Rejoins", "Next", "Details"):
             t.add_column(col, overflow="fold")
         for i in self.insts:
             label, style = STATE_LABEL.get(i.state, (i.state, ""))
@@ -2032,7 +2213,7 @@ class Engine:
         if buf is not None:
             parts.append(Panel(Text.assemble(("› ", "bold yellow"), (scrub(buf), "bold"), ("█", "blink")),
                                title="Console", border_style="yellow"))
-        parts.append(Panel(ev, title="Latest events (newest first)", border_style="blue"))
+        parts.append(Panel(ev, title="Latest events (newest on top)", border_style="blue"))
         return Group(*parts)
 
 
@@ -2058,11 +2239,11 @@ def confirm(prompt):
 
 
 def pause():
-    ask("Press Enter to go back to the menu")
+    ask("Press Enter to return to the menu")
 
 
 def onoff(v):
-    return Text("ON" if v else "OFF", style="bold green" if v else "bold red")
+    return Text("On" if v else "Off", style="bold green" if v else "bold red")
 
 
 def clear_screen():
@@ -2080,7 +2261,7 @@ def banner(cfg):
         ("Mode: ", "dim"), ("ROOT" if ENV.root else "non-root", "bold green" if ENV.root else "bold yellow"),
         ("   Instances: ", "dim"), (str(len(cfg.d["detected"])), "bold"),
         ("   Game link: ", "dim"), ("set" if link else "not set", "green" if link else "red"),
-        ("   Webhook: ", "dim"), ("ON" if cfg.d["webhook"]["enabled"] else "OFF",
+        ("   Webhook: ", "dim"), ("On" if cfg.d["webhook"]["enabled"] else "Off",
                                   "green" if cfg.d["webhook"]["enabled"] else "red")))
     console.print(Text("Folder: " + BASE, style="dim"))
     console.print()
@@ -2092,7 +2273,7 @@ def selected_packages(cfg):
 
 
 def refresh_packages(cfg):
-    found = scan_packages(cfg.d["package_prefix"])
+    found = scan_packages(prefixes(cfg))
     if found:
         cfg.d["detected"] = found
         cfg.d["packages"] = [p for p in cfg.d["packages"] if p in found]
@@ -2105,7 +2286,7 @@ def menu_start(cfg, hook):
     parsed = parse_link(cfg.d["game_link"])
     pkgs = selected_packages(cfg)
     if not parsed:
-        say("Game link not set (or invalid). Go to Menu 3 first", "red")
+        say("No game link set (or the link is invalid). Go to Menu 3 first", "red")
         return pause()
     if not pkgs:
         say("No Roblox packages found. Go to Menu 4 to scan first", "red")
@@ -2114,12 +2295,12 @@ def menu_start(cfg, hook):
         have = {p for p, _ in cookie_pairs(cfg)[0]}
         need = [p for p in pkgs if p not in have]
         if need:
-            say("Pulling cookies from %d app(s) that have none yet..." % len(need), "dim")
+            say("Pulling cookies from the app for %d instance(s) that have none yet..." % len(need), "dim")
             got = {}
             for pkg, ck, name, msg in pull_validated(need):
                 if ck:
                     got[pkg] = ck
-                say("%s: %s" % (pkg, ("Got the cookie of " + hide_name(name)) if ck else msg), "green" if ck else "yellow")
+                say("%s: %s" % (pkg, ("got the cookie of " + hide_name(name)) if ck else msg), "green" if ck else "yellow")
             if got:
                 store_cookies(cfg, got)
     if cfg.d["auto"]["cookie_login_on_start"]:
@@ -2138,13 +2319,13 @@ def menu_start(cfg, hook):
     hc = cfg.d["heartbeat"]
     if hc["enabled"]:
         hb = Heartbeats()
-        hbs = HBServer(hb, hc["port"], cfg.d["package_prefix"])
+        hbs = HBServer(hb, hc["port"], prefixes(cfg))
         hb.single = len(insts) == 1
         try:
             hbs.start()
             say("Receiving heartbeat at 127.0.0.1:%d (test: curl http://127.0.0.1:%d/ping)" % (hbs.port, hbs.port), "green")
         except OSError as e:
-            say("Cannot open the heartbeat port (%s); heartbeat disabled for this run" % e, "red")
+            say("Cannot open the heartbeat port (%s), skipping heartbeat" % e, "red")
             hb = hbs = None
     if cfg.d["auto"]["wake_lock"]:
         wake_lock(True)
@@ -2174,25 +2355,25 @@ def status_view(cfg, info, buf=""):
     cmap = dict(pairs)
     fg = foreground_text() if ENV.root else ""
     t = Table(title="Detected instances", box=box.ROUNDED, header_style="bold cyan", expand=True)
-    for col in ("#", "Package", "Selected", "Cookie", "Running", "Foreground"):
+    for col in ("#", "Package", "Selected", "Cookie", "Running", "On screen"):
         t.add_column(col)
     sel = selected_packages(cfg)
     for i, pkg in enumerate(det, 1):
         alive = proc_alive(pkg)
-        run = Text("yes", style="green") if alive else (Text("No", style="red") if ENV.root else Text("Unknown", style="magenta"))
-        front = Text("-") if not ENV.root else (Text("yes", style="green") if (pkg + "/") in fg else Text("No", style="dim"))
+        run = Text("Yes", style="green") if alive else (Text("No", style="red") if ENV.root else Text("Unknown", style="magenta"))
+        front = Text("-") if not ENV.root else (Text("Yes", style="green") if (pkg + "/") in fg else Text("No", style="dim"))
         t.add_row(str(i), pkg, onoff(pkg in sel), Text("Yes" if pkg in cmap else "-"), run, front)
     mem, load = mem_available_mb(), sys_load()
-    foot = "Mode: %s | check every %ss | launch delay %ss | cookie lines in file: %d | free RAM %s MB | load %s%s" % (
+    foot = "Mode: %s | check every %ss | launch delay %ss | cookies in file: %d line(s) | free RAM %s MB | load %s%s" % (
         "ROOT" if ENV.root else "non-root", cfg.d["check_interval"], cfg.d["launch_delay"], n_ck,
         mem if mem is not None else "?", ("%.1f" % load) if load is not None else "?",
-        "" if ENV.root else " | non-root mode cannot check processes/foreground")
-    return Group(t, T(foot, "dim"), T("Live panel refreshes automatically — press Enter or Ctrl+C to go back", "yellow"))
+        "" if ENV.root else " | non-root mode cannot check processes/screen")
+    return Group(t, T(foot, "dim"), T("Live panel refreshes automatically — press Enter or Ctrl+C to return to the menu", "yellow"))
 
 
 def menu_status(cfg):
     if not cfg.d["detected"]:
-        say("No packages found yet. Try Menu 4 (scan packages)", "red")
+        say("No packages found. Try Menu 4 (scan packages)", "red")
         return pause()
     info = cookie_pairs(cfg)
     pf = cfg.d["performance"]
@@ -2214,16 +2395,16 @@ def menu_settings(cfg):
         link = cfg.d["game_link"]
         t.add_row("1", "Game link / Place ID", T((link[:60] + "…" if len(link) > 60 else link) or "(not set)"))
         t.add_row("2", "Check interval (seconds)", str(cfg.d["check_interval"]))
-        t.add_row("3", "Delay between launching instances (seconds)", str(cfg.d["launch_delay"]))
-        t.add_row("4", "Hide account names (streamer mode: first 4 chars shown, rest as #)", onoff(cfg.d["ui"]["streamer_mode"]))
+        t.add_row("3", "Delay between launching each instance (seconds)", str(cfg.d["launch_delay"]))
+        t.add_row("4", "Hide account names (streamer mode: first 4 characters, the rest #)", onoff(cfg.d["ui"]["streamer_mode"]))
         console.print(t)
         if p:
-            say("Link actually used to launch: " + p[0], "dim")
-        c = ask("Choose a number (0=back)")
+            say("Link actually used to open: " + p[0], "dim")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c == "1":
-            v = ask("Paste the game link (roblox.com/games/..., private-server link, share link, or Place ID):")
+            v = ask("Paste the game link (roblox.com/games/..., private server link, share link or Place ID):")
             if v and not parse_link(v):
                 say("Invalid link format", "red")
                 pause()
@@ -2245,10 +2426,10 @@ def menu_settings(cfg):
 
 
 def menu_scan(cfg):
-    say("Scanning packages %s* ..." % cfg.d["package_prefix"], "cyan")
+    say("Scanning packages %s ..." % ", ".join(p + "*" for p in prefixes(cfg)), "cyan")
     found = refresh_packages(cfg)
     if not found:
-        say("No packages found (if your instances use other names, type the package names, comma-separated)", "red")
+        say("No packages found (if your instances use other names, type the package names yourself, separated by commas)", "red")
         v = ask("Packages (Enter=skip):")
         names = [x.strip() for x in v.split(",") if re.fullmatch(r"[\w.]+", x.strip())]
         if names:
@@ -2264,7 +2445,7 @@ def menu_scan(cfg):
     for i, p in enumerate(found, 1):
         t.add_row(str(i), p, onoff(p in sel))
     console.print(t)
-    v = ask("Choose which to run, e.g. 1,3 | all=everything | Enter=keep as is:").lower()
+    v = ask("Choose which to run, e.g. 1,3 | all=everything | Enter=keep current:").lower()
     if v == "all":
         cfg.d["packages"] = []
     elif v:
@@ -2281,13 +2462,13 @@ def menu_cookie(cfg):
         say("Sample file created: " + COOKIE_PATH, "green")
     pairs, n_ck = cookie_pairs(cfg)
     if not n_ck:
-        say("No cookies in cookie.txt yet  (1 line per account, in instance order)\nFile: " + COOKIE_PATH, "yellow")
+        say("No cookies in cookie.txt yet  (1 line / 1 account, in instance order)\nFile: " + COOKIE_PATH, "yellow")
         return pause()
     det = cfg.d["detected"]
     if n_ck > len(det):
-        say("More cookies than instances (%d > %d); extras will be ignored" % (n_ck, len(det)), "yellow")
+        say("More cookies than instances (%d > %d), the extras will be skipped" % (n_ck, len(det)), "yellow")
     t = Table(title="Cookies matched to instances (in order)", box=box.ROUNDED, header_style="bold cyan")
-    for col in ("Line", "Package", "Cookie", "Check result"):
+    for col in ("Line", "Package", "Cookie", "Check"):
         t.add_column(col)
     valid = []
     for i, (pkg, ck) in enumerate(pairs, 1):
@@ -2298,9 +2479,9 @@ def menu_cookie(cfg):
                                               style="green" if uid else "red"))
     console.print(t)
     if not ENV.root:
-        say("Non-root mode: cookies can only be validated; injecting them into the app requires root", "yellow")
+        say("Non-root mode: can only check cookies. Injecting cookies into the app needs root", "yellow")
         return pause()
-    if valid and confirm("Inject %d valid cookie(s) into the apps (apps will be force-stopped)?" % len(valid)):
+    if valid and confirm("Inject %d valid cookie(s) into the apps (the apps will be force-stopped)?" % len(valid)):
         for pkg, ok, msg in cookie_login(valid):
             say("%s: %s" % (pkg, msg), "green" if ok else "red")
     pause()
@@ -2308,17 +2489,22 @@ def menu_cookie(cfg):
 
 def api_post(s, url, body=None):
     """POST with CSRF retry -> (ok, message)"""
+    retried = False
     try:
+        if "apis.roblox.com" in url:
+            s.headers.setdefault("Origin", "https://www.roblox.com")
+            s.headers.setdefault("Referer", "https://www.roblox.com/")
         r = s.post(url, json=body, timeout=15)
         if r.status_code == 403 and "x-csrf-token" in r.headers:
             s.headers["X-CSRF-TOKEN"] = r.headers["x-csrf-token"]
             r = s.post(url, json=body, timeout=15)
+            retried = True
     except Exception as e:
         return False, scrub(e)[:80]
     msg = ""
     try:
         j = r.json()
-        msg = (j.get("errors") or [{}])[0].get("message", "")
+        msg = (j.get("errors") or [{}])[0].get("message", "") or j.get("message", "")
         if r.status_code == 200 and j.get("success") is False:
             return False, msg or "success=false"
     except Exception:
@@ -2328,7 +2514,12 @@ def api_post(s, url, body=None):
     if r.status_code == 401:
         msg = "cookie expired"
     elif r.status_code == 429:
-        msg = "too many requests, wait a while"
+        msg = "too many requests, wait a moment"
+    if not msg and r.status_code not in (401, 429):
+        msg = scrub(" ".join((r.text or "").split()))[:70] or "(empty response body)"
+    if r.status_code == 403:
+        msg += " [csrf: " + ("token resent and still rejected" if retried else
+                             "server did not send a token") + "]"
     return False, ("HTTP %d %s" % (r.status_code, msg)).strip()
 
 
@@ -2354,11 +2545,81 @@ def resolve_user(s, text):
     return None, None
 
 
-SOCIAL_URL = {"block": "https://accountsettings.roblox.com/v1/users/%d/block",
-              "unblock": "https://accountsettings.roblox.com/v1/users/%d/unblock",
+SOCIAL_URL = {"block": "https://apis.roblox.com/user-blocking-api/v1/users/%d/block-user",
+              "unblock": "https://apis.roblox.com/user-blocking-api/v1/users/%d/unblock-user",
               "friend": "https://friends.roblox.com/v1/users/%d/request-friendship",
               "accept": "https://friends.roblox.com/v1/users/%d/accept-friend-request"}
-SOCIAL_NAME = {"block": "Block", "unblock": "Unblock", "friend": "Send friend request"}
+SOCIAL_NAME = {"block": "Block", "unblock": "Unblock", "friend": "Send friend request to"}
+
+SOCIAL_LEGACY = {"block": "https://accountsettings.roblox.com/v1/users/%d/block",
+                 "unblock": "https://accountsettings.roblox.com/v1/users/%d/unblock"}
+
+
+def ensure_tracker(s, uid=0, force_fake=False):
+    """Make the session carry the RBXEventTrackerV2 (browserid) cookie that apis.roblox.com uses as BrowserTrackerID: ask the server first, create one ourselves if that fails"""
+    if not force_fake:
+        if any(c.name == "RBXEventTrackerV2" for c in s.cookies):
+            return
+        if not getattr(s, "_garnt_home", False):
+            s._garnt_home = True
+            try:
+                s.get("https://www.roblox.com/home", timeout=15)
+            except Exception:
+                pass
+            if any(c.name == "RBXEventTrackerV2" for c in s.cookies):
+                return
+    import random
+    now = datetime.now()
+    val = "CreateDate=%d/%d/%d %d:%02d:%02d %s&rbxid=%d&browserid=%d" % (
+        now.month, now.day, now.year, now.hour % 12 or 12, now.minute, now.second,
+        "AM" if now.hour < 12 else "PM", int(uid or 0), random.randint(10 ** 10, 10 ** 11 - 1))
+    s.cookies.set("RBXEventTrackerV2", val, domain=".roblox.com", path="/")
+
+
+def is_blocking(s, tid):
+    """True/False/None (unknown): whether this account has tid in its block list"""
+    cursor = ""
+    try:
+        for _ in range(10):
+            r = s.get("https://apis.roblox.com/user-blocking-api/v1/users/get-blocked-users",
+                      params={"cursor": cursor, "count": 50}, timeout=15)
+            if r.status_code != 200:
+                return None
+            d = (r.json() or {}).get("data") or {}
+            if int(tid) in [int(x) for x in (d.get("blockedUserIds") or [])]:
+                return True
+            cursor = d.get("cursor") or ""
+            if not cursor:
+                return False
+    except Exception:
+        return None
+    return None
+
+
+def social_call(s, action, tid, uid=0):
+    """Block/unblock/friend -> (ok, message). Uses user-blocking-api first, falls back to the old URL on 404"""
+    body = {} if action != "friend" else None
+    web = "apis.roblox.com" in SOCIAL_URL[action]
+    if web:
+        ensure_tracker(s, uid)
+    ok, msg = api_post(s, SOCIAL_URL[action] % tid, body)
+    if web and not ok and "BrowserTrackerID" in msg:
+        ensure_tracker(s, uid, force_fake=True)
+        ok, msg = api_post(s, SOCIAL_URL[action] % tid, body)
+    if web and not ok and msg.startswith("HTTP 400") and action in ("block", "unblock"):
+        st = is_blocking(s, tid)
+        if st is True and action == "block":
+            return True, "already blocked (checked from the block list)"
+        if st is False and action == "unblock":
+            return True, "not blocked, nothing to do"
+        if st is not None:
+            msg += " [block list checked: " + ("blocked" if st else "not blocked") + "]"
+    if not ok and msg.startswith("HTTP 404") and action in SOCIAL_LEGACY:
+        ok2, msg2 = api_post(s, SOCIAL_LEGACY[action] % tid, body)
+        if ok2:
+            return True, msg2
+        msg += " / " + msg2
+    return ok, msg
 
 
 def social_accounts(cfg):
@@ -2370,12 +2631,12 @@ def social_accounts(cfg):
         if uid:
             out.append((pkg, s, uid, name))
         else:
-            say("%s: cookie not usable (%s)" % (pkg, err), "red")
+            say("%s: cookie unusable (%s)" % (pkg, err), "red")
     return out
 
 
 def pick_accounts(accts):
-    v = ask("Which accounts (e.g. 1,3 or all, Enter=all):").strip().lower()
+    v = ask("Choose accounts (e.g. 1,3 or all, Enter=all):").strip().lower()
     if v in ("", "all", "a"):
         return list(accts)
     idx = {int(x) for x in v.replace(" ", "").split(",") if x.isdigit()}
@@ -2387,9 +2648,9 @@ def run_social(action, accts, tid):
     rows = []
     for pkg, s, uid, name in accts:
         if uid == tid:
-            rows.append((pkg, name, False, "same as the target, skipped"))
+            rows.append((pkg, name, False, "same account as the target, skipped"))
             continue
-        ok, msg = api_post(s, SOCIAL_URL[action] % tid, {} if action != "friend" else None)
+        ok, msg = social_call(s, action, tid, uid)
         rows.append((pkg, name, ok, msg))
         time.sleep(1.5)     # stay under the rate limit
     return rows
@@ -2406,34 +2667,257 @@ def show_social(rows):
 
 def pick_target(accts):
     """Target of block/unblock/friend: one of the cookie accounts, or a typed username / ID (both kept). -> (id, name)"""
-    src = ask("Target from: 1=a cookie account, 2=type a Roblox username/ID (Enter=1):").strip()
+    src = ask("Pick the target from: 1=accounts in cookies, 2=type a Roblox name/ID (Enter=1):").strip()
     if src in ("", "1"):
-        v = ask("Number of the target account (see the table above):").strip()
+        v = ask("Pick the target account number (from the table above):").strip()
         if v.isdigit() and 1 <= int(v) <= len(accts):
             a = accts[int(v) - 1]
             return a[2], a[3]
         return None, None
-    who = ask("Target username or user ID:")
+    who = ask("Target username or User ID:")
     return resolve_user(accts[0][1], who) if who else (None, None)
+
+
+def blocked_ids(s):
+    """Set of User IDs this account has blocked, or None if it cannot be read"""
+    out, cursor = set(), ""
+    try:
+        for _ in range(40):
+            r = s.get("https://apis.roblox.com/user-blocking-api/v1/users/get-blocked-users",
+                      params={"cursor": cursor, "count": 50}, timeout=15)
+            if r.status_code != 200:
+                return None
+            d = (r.json() or {}).get("data") or {}
+            out.update(int(x) for x in (d.get("blockedUserIds") or []))
+            cursor = d.get("cursor") or ""
+            if not cursor:
+                return out
+    except Exception:
+        return None
+    return out
+
+
+def block_each_other(cfg, accts):
+    """Every account in the cookies blocks every other one (both directions), no target to pick"""
+    seen = set()
+    accts = [a for a in accts if not (a[2] in seen or seen.add(a[2]))]   # two cookies of the same account count once
+    n = len(accts)
+    if n < 2:
+        say("Need at least 2 usable accounts", "red")
+        return pause()
+    try:
+        gap = max(0, int(cfg.d.get("block_gap_sec", 20)))
+    except (TypeError, ValueError):
+        gap = 20
+    est = max(1, int(round((n - 1) * max(gap, n * 1.0) / 60.0)))
+    if not confirm("Mutual block of %d accounts (%d blocks), takes about %d min?" % (n, n * (n - 1), est)):
+        return
+    say("Reading each account's block list...", "dim")
+    have = []
+    for pkg, s, uid, name in accts:
+        ensure_tracker(s, uid)
+        have.append(blocked_ids(s))
+    stats = [[0, 0, 0] for _ in accts]      # newly blocked, already blocked, failed
+    fails, last = [], [0.0] * n
+    try:
+        for k in range(1, n):
+            say("Round %d/%d" % (k, n - 1), "bold")
+            for i in range(n):
+                j = (i + k) % n
+                pkg, s, uid, name = accts[i]
+                tpkg, _, tuid, tname = accts[j]
+                if uid == tuid:
+                    continue
+                if have[i] is not None and tuid in have[i]:
+                    stats[i][1] += 1
+                    continue
+                for attempt in range(3):
+                    wait = last[i] + gap - time.time()
+                    if wait > 0:
+                        time.sleep(wait)
+                    ok, msg = social_call(s, "block", tuid, uid)
+                    last[i] = time.time()
+                    if ok or not msg.startswith("HTTP 429") or attempt == 2:
+                        break
+                    say("%s: rate limited (429), waiting 60 seconds then retrying" % pkg, "yellow")
+                    time.sleep(60)
+                say("  %s → %s: %s" % (pkg, hide_name(tname), ("✓ " if ok else "✗ ") + msg), "green" if ok else "red")
+                if ok:
+                    stats[i][0] += 1
+                else:
+                    stats[i][2] += 1
+                    fails.append((pkg, tname, msg))
+                time.sleep(1)
+    except KeyboardInterrupt:
+        say("Stopped (Ctrl+C), summary of what was done so far", "yellow")
+    t = Table(box=box.ROUNDED, header_style="bold cyan")
+    for col in ("Package", "Account", "Result"):
+        t.add_column(col)
+    for (pkg, _, _, name), (a, b, c) in zip(accts, stats):
+        t.add_row(pkg, hide_name(name), Text("newly blocked %d | already blocked %d | failed %d" % (a, b, c),
+                                             style="green" if c == 0 else "red"))
+    console.print(t)
+    for pkg, tname, msg in fails[:8]:
+        say("%s → %s: %s" % (pkg, hide_name(tname), msg), "red")
+    if len(fails) > 8:
+        say("...and %d more" % (len(fails) - 8), "red")
+    pause()
+
+
+def unblock_each_other(cfg, accts):
+    """Every account in the cookies unblocks the others (only pairs that are actually blocked), other block-list entries are untouched"""
+    seen = set()
+    accts = [a for a in accts if not (a[2] in seen or seen.add(a[2]))]   # two cookies of the same account count once
+    n = len(accts)
+    if n < 2:
+        say("Need at least 2 usable accounts", "red")
+        return pause()
+    try:
+        gap = max(0, int(cfg.d.get("block_gap_sec", 20)))
+    except (TypeError, ValueError):
+        gap = 20
+    say("Reading each account's block list...", "dim")
+    have = []
+    for pkg, s, uid, name in accts:
+        ensure_tracker(s, uid)
+        have.append(blocked_ids(s))
+
+    def todo(i, j):
+        return accts[i][2] != accts[j][2] and (have[i] is None or accts[j][2] in have[i])
+
+    per = [sum(1 for j in range(n) if todo(i, j)) for i in range(n)]
+    total = sum(per)
+    if not total:
+        say("No pair is blocking each other, nothing to do", "green")
+        return pause()
+    est = max(1, int(round(max(per) * gap / 60.0)))
+    if not confirm("Mutual unblock of %d pair(s) (directions), takes about %d min?" % (total, est)):
+        return
+    stats = [[0, n - 1 - per[i], 0] for i in range(n)]      # unblocked, not blocked (skipped), failed
+    fails, last = [], [0.0] * n
+    try:
+        for k in range(1, n):
+            if not any(todo(i, (i + k) % n) for i in range(n)):
+                continue
+            say("Round %d/%d" % (k, n - 1), "bold")
+            for i in range(n):
+                j = (i + k) % n
+                if not todo(i, j):
+                    continue
+                pkg, s, uid, name = accts[i]
+                tpkg, _, tuid, tname = accts[j]
+                for attempt in range(3):
+                    wait = last[i] + gap - time.time()
+                    if wait > 0:
+                        time.sleep(wait)
+                    ok, msg = social_call(s, "unblock", tuid, uid)
+                    last[i] = time.time()
+                    if ok or not msg.startswith("HTTP 429") or attempt == 2:
+                        break
+                    say("%s: rate limited (429), waiting 60 seconds then retrying" % pkg, "yellow")
+                    time.sleep(60)
+                say("  %s → %s: %s" % (pkg, hide_name(tname), ("✓ " if ok else "✗ ") + msg), "green" if ok else "red")
+                if ok:
+                    stats[i][0] += 1
+                else:
+                    stats[i][2] += 1
+                    fails.append((pkg, tname, msg))
+                time.sleep(1)
+    except KeyboardInterrupt:
+        say("Stopped (Ctrl+C), summary of what was done so far", "yellow")
+    t = Table(box=box.ROUNDED, header_style="bold cyan")
+    for col in ("Package", "Account", "Result"):
+        t.add_column(col)
+    for (pkg, _, _, name), (a, b, c) in zip(accts, stats):
+        t.add_row(pkg, hide_name(name), Text("unblocked %d | not blocked %d | failed %d" % (a, b, c),
+                                             style="green" if c == 0 else "red"))
+    console.print(t)
+    for pkg, tname, msg in fails[:8]:
+        say("%s → %s: %s" % (pkg, hide_name(tname), msg), "red")
+    if len(fails) > 8:
+        say("...and %d more" % (len(fails) - 8), "red")
+    pause()
+
+
+def launch_all_roblox(cfg):
+    """Open every selected Roblox instance one at a time, waiting open_all_delay seconds (default 10) between them"""
+    pkgs = selected_packages(cfg)
+    if not pkgs:
+        say("No Roblox packages found. Go to Menu 4 to scan first", "red")
+        return pause()
+    try:
+        delay = max(0, int(cfg.d.get("open_all_delay", 10)))
+    except (TypeError, ValueError):
+        delay = 10
+    parsed = parse_link(cfg.d["game_link"])
+    uri = parsed[0] if parsed else None
+    say("Will open the game from the configured link" if uri else
+        "No game link set, will only open the Roblox app", "dim")
+    if not confirm("Open %d Roblox instance(s), %d seconds apart?" % (len(pkgs), delay)):
+        return
+    done = 0
+    try:
+        for i, pkg in enumerate(pkgs, 1):
+            if uri:
+                ok, msg = open_game(pkg, uri, False)
+            else:
+                rc, out = sh("monkey -p %s -c android.intent.category.LAUNCHER 1" % shlex.quote(pkg),
+                             root=ENV.root, timeout=30)
+                ok, msg = rc == 0, (scrub(out.strip()[:120]) or "ok")
+            done += 1 if ok else 0
+            say("[%d/%d] %s: %s" % (i, len(pkgs), pkg, msg), "green" if ok else "red")
+            if i < len(pkgs) and delay:
+                say("Waiting %d seconds before the next one..." % delay, "dim")
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        say("Stopped (Ctrl+C)", "yellow")
+    say("Opened %d/%d instances" % (done, len(pkgs)), "green" if done == len(pkgs) else "yellow")
+    pause()
+
+
+def menu_open_all(cfg):
+    while True:
+        banner(cfg)
+        t = Table(title="Open all Roblox", box=box.ROUNDED, header_style="bold cyan")
+        for col in ("#", "Item", "Value"):
+            t.add_column(col)
+        t.add_row("1", "Open every selected Roblox instance now (one by one, no force-stop)", "")
+        t.add_row("2", "Delay between instances (seconds, 0-600)", str(cfg.d.get("open_all_delay", 10)))
+        console.print(t)
+        c = ask("Pick a number (0=back)")
+        if c == "0":
+            return
+        if c == "1":
+            launch_all_roblox(cfg)
+        elif c == "2":
+            v = ask("New delay (0-600):")
+            if v.isdigit() and 0 <= int(v) <= 600:
+                cfg.d["open_all_delay"] = int(v)
+                cfg.save()
+            elif v:
+                say("Value must be between 0 and 600", "red")
+                pause()
 
 
 def menu_social(cfg):
     if not cookie_pairs(cfg)[0]:
-        say("No cookies in cookie.txt yet (menu 5)", "red")
+        say("No cookies in cookie.txt yet (Menu 5)", "red")
         return pause()
-    say("Checking the accounts from the cookies...", "dim")
+    say("Checking accounts from the cookies...", "dim")
     accts = social_accounts(cfg)
     if not accts:
         return pause()
     while True:
         banner(cfg)
-        t = Table(title="Block / friends (using the cookie accounts)", box=box.ROUNDED, header_style="bold cyan")
+        t = Table(title="Block / friends (using accounts from the cookies)", box=box.ROUNDED, header_style="bold cyan")
         for col in ("#", "Item"):
             t.add_column(col)
         t.add_row("1", "Block a user")
         t.add_row("2", "Unblock a user")
         t.add_row("3", "Add friend (send a request to a user)")
-        t.add_row("4", "Friend our own accounts with each other (send + auto-accept)")
+        t.add_row("4", "Add friends between our own accounts (send request + auto-accept)")
+        t.add_row("5", "Mutual block (every account in the cookies blocks the others, no target to pick)")
+        t.add_row("6", "Mutual unblock (every account in the cookies unblocks the others, only pairs that block each other)")
         console.print(t)
         a = Table(box=box.SIMPLE, header_style="bold cyan")
         for col in ("#", "Package", "Account"):
@@ -2441,7 +2925,7 @@ def menu_social(cfg):
         for n, (pkg, _, _, name) in enumerate(accts, 1):
             a.add_row(str(n), pkg, hide_name(name))
         console.print(a)
-        c = ask("Choose a number (0=back)")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c in ("1", "2", "3"):
@@ -2455,13 +2939,17 @@ def menu_social(cfg):
             if sel and confirm("%s %s (%d) with %d account(s)?" % (SOCIAL_NAME[action], hide_name(tname), tid, len(sel))):
                 show_social(run_social(action, sel, tid))
                 pause()
+        elif c == "6":
+            unblock_each_other(cfg, accts)
+        elif c == "5":
+            block_each_other(cfg, accts)
         elif c == "4":
             sel = pick_accounts(accts)
             if len(sel) < 2:
-                say("Pick at least 2 accounts", "red")
+                say("Select at least 2 accounts", "red")
                 pause()
                 continue
-            if not confirm("Friend %d accounts with each other?" % len(sel)):
+            if not confirm("Add friends between %d accounts?" % len(sel)):
                 continue
             rows = []
             for i in range(len(sel)):
@@ -2479,13 +2967,13 @@ def menu_social(cfg):
 
 def menu_cookie_pull(cfg):
     if not ENV.root:
-        say("Pulling cookies from the apps requires root", "yellow")
+        say("Pulling cookies from the app needs root", "yellow")
         return pause()
     det = cfg.d["detected"]
     if not det:
-        say("No packages found yet; try menu 4 (scan packages)", "red")
+        say("No packages found. Try Menu 4 (scan packages)", "red")
         return pause()
-    say("Reading the cookie of %d instance(s) and checking it with the Roblox API..." % len(det), "dim")
+    say("Reading cookies from %d app instance(s), then checking with the Roblox API..." % len(det), "dim")
     results = pull_validated(det)
     t = Table(title="Cookies pulled from the Roblox apps", box=box.ROUNDED, header_style="bold cyan")
     for col in ("#", "Package", "Account", "Result"):
@@ -2497,10 +2985,10 @@ def menu_cookie_pull(cfg):
         t.add_row(str(i), pkg, hide_name(name) if name else "-",
                   Text(("Pulled, valid: " + mask(ck)) if ck else msg, style="green" if ck else "red"))
     console.print(t)
-    if found and confirm("Save %d cookie(s) to cookie.txt (replaces that instance's line)?" % len(found)):
+    if found and confirm("Save %d cookie(s) to cookie.txt (replacing that instance's line)?" % len(found)):
         n = store_cookies(cfg, found)
         say("Saved %d line(s) → " % n + COOKIE_PATH, "green")
-        say("These cookies will be used for the in-game API check while rejoining (enable the Roblox API presence check in menu 6)", "dim")
+        say("When rejoining, these cookies are used to check in-game status via the API (turn on \"Check in-game status via Roblox API\" at Menu 6)", "dim")
     pause()
 
 
@@ -2510,10 +2998,10 @@ def menu_cookie_hub(cfg):
         t = Table(title="Cookies", box=box.ROUNDED, header_style="bold cyan")
         for col in ("#", "Item"):
             t.add_column(col)
-        t.add_row("1", "Check / inject the cookies from cookie.txt into the apps (cookie login)")
-        t.add_row("2", "Pull the cookies from the Roblox apps into cookie.txt (for the API status check) - root")
+        t.add_row("1", "Check / inject cookies from cookie.txt into the apps (cookie login)")
+        t.add_row("2", "Pull cookies from the Roblox apps into cookie.txt (to check status via the API) — root")
         console.print(t)
-        c = ask("Choose a number (0=back)")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c == "1":
@@ -2524,13 +3012,13 @@ def menu_cookie_hub(cfg):
 
 AUTO_ITEMS = [
     ("start_on_launch", "Start rejoining as soon as the tool opens", False),
-    ("wake_lock", "Wake-lock while running", False),
-    ("force_stop", "Force-stop before relaunching the game", True),
-    ("foreground_check", "Check that the app is in the foreground", True),
-    ("screenshot_on_crash", "Screenshot when dropped/frozen", True),
-    ("cookie_login_on_start", "Automatic cookie login before start", True),
-    ("presence_check", "Check in-game state via the Roblox API (needs cookies)", False),
-    ("cookie_pull_on_start", "Auto-pull cookies from the apps before start (only instances without a cookie)", True),
+    ("wake_lock", "Enable wake-lock while running", False),
+    ("force_stop", "Force-stop before reopening the game", True),
+    ("foreground_check", "Check that the app is on screen", True),
+    ("screenshot_on_crash", "Take a screenshot on drop/freeze", True),
+    ("cookie_login_on_start", "Log in with cookies automatically before starting", True),
+    ("presence_check", "Check in-game status via Roblox API (needs cookies)", False),
+    ("cookie_pull_on_start", "Pull cookies from the apps automatically before starting (only instances without a cookie)", True),
 ]
 
 
@@ -2545,12 +3033,11 @@ def menu_auto(cfg):
             t.add_row(str(i), label, onoff(a[k]), "Root only" if root_only else "")
         n = len(AUTO_ITEMS)
         t.add_row(str(n + 1), "Timed rejoin (minutes, 0=off)", str(a["timed_rejoin_min"]), "")
-        t.add_row(str(n + 2), "Time to wait for joining after launch (seconds)", str(cfg.d["join_grace"]), "")
+        t.add_row(str(n + 2), "Time to wait for joining after opening the app (seconds)", str(cfg.d["join_grace"]), "")
         t.add_row(str(n + 3), "Heartbeat (in-game script) ...", onoff(cfg.d["heartbeat"]["enabled"]), "Submenu")
-        t.add_row(str(n + 4), "Performance: clear RAM / reduce CPU use ...", "", "Submenu")
-        t.add_row(str(n + 5), "Screen: Disconnected check / clear stacked windows ...", onoff(cfg.d["dialog_detect"]["enabled"]), "Submenu")
+        t.add_row(str(n + 4), "Performance: RAM cleanup / lower CPU usage ...", "", "Submenu")
         console.print(t)
-        c = ask("Choose a number to toggle/edit (0=back)")
+        c = ask("Pick a number to toggle/edit (0=back)")
         if c == "0":
             return
         if c.isdigit() and 1 <= int(c) <= n:
@@ -2561,8 +3048,6 @@ def menu_auto(cfg):
             menu_heartbeat(cfg)
         elif c == str(n + 4):
             menu_perf(cfg)
-        elif c == str(n + 5):
-            menu_screen(cfg)
         elif c in (str(n + 1), str(n + 2)):
             v = ask("New value (number):")
             if v.isdigit():
@@ -2573,24 +3058,120 @@ def menu_auto(cfg):
                 cfg.save()
 
 
+def fps_cap_summary(cfg):
+    default, caps = fps_caps(cfg)
+    if not default and not caps:
+        return "not set"
+    return "%d account(s), default %s" % (len(caps), default or "leave alone")
+
+
+def read_cap(prompt, allow_zero=False):
+    """-> (ok, value). Enter = clear (None)."""
+    v = ask(prompt).strip()
+    if not v:
+        return True, None
+    if v.isdigit() and (FPS_CAP_MIN <= int(v) <= FPS_CAP_MAX or (allow_zero and int(v) == 0)):
+        return True, int(v)
+    say("Value must be between %d and %d" % (FPS_CAP_MIN, FPS_CAP_MAX), "red")
+    pause()
+    return False, None
+
+
+def menu_fps_cap(cfg):
+    """Per-account FPS cap. The account is identified by its Roblox user ID (fetched from the cookie),
+    and the generated heartbeat.lua looks the ID up in-game, so it follows the account, not the clone."""
+    fc = cfg.d["heartbeat"].setdefault("fps_cap", {})
+    fc.setdefault("default", 0)
+    if not isinstance(fc.get("accounts"), dict):
+        fc["accounts"] = {}
+    if not cookie_pairs(cfg)[0]:
+        say("No cookies in cookie.txt yet (Menu 5)", "red")
+        return pause()
+    say("Fetching Roblox IDs from the cookies...", "dim")
+    accts = social_accounts(cfg)
+    if not accts:
+        return pause()
+
+    def apply():
+        cfg.save()
+        if cfg.d["autoexec"]["auto_create"]:
+            report_autoexec(cfg, install_autoexec(cfg), quiet_ok=False)
+        say("The new script takes effect the next time the game is joined (rejoin or reopen). The executor needs setfpscap", "dim")
+        pause()
+
+    while True:
+        banner(cfg)
+        t = Table(title="FPS cap per account (matched by Roblox ID)", box=box.ROUNDED, header_style="bold cyan")
+        for col in ("#", "Package", "Account", "Roblox ID", "FPS cap"):
+            t.add_column(col)
+        for n, (pkg, _, uid, name) in enumerate(accts, 1):
+            rec = fc["accounts"].get(str(uid))
+            cap = rec.get("cap") if isinstance(rec, dict) else rec
+            t.add_row(str(n), pkg, hide_name(name), hide_id(uid), str(cap) if cap else "not set")
+        console.print(t)
+        n = len(accts)
+        a = Table(box=box.SIMPLE, header_style="bold cyan")
+        for col in ("#", "Item", "Value"):
+            a.add_column(col)
+        a.add_row(str(n + 1), "Set the same cap for every account in the table", "")
+        a.add_row(str(n + 2), "Default for accounts not in the table (0=leave alone)", str(fc["default"] or "leave alone"))
+        a.add_row(str(n + 3), "Clear everything", "")
+        console.print(a)
+        c = ask("Pick a number (0=back)")
+        if c == "0":
+            return
+        if c.isdigit() and 1 <= int(c) <= n:
+            pkg, _, uid, name = accts[int(c) - 1]
+            ok, cap = read_cap("FPS cap for %s (%d-%d, Enter=clear):" % (hide_name(name), FPS_CAP_MIN, FPS_CAP_MAX))
+            if not ok:
+                continue
+            if cap:
+                fc["accounts"][str(uid)] = {"name": name, "cap": cap}
+            else:
+                fc["accounts"].pop(str(uid), None)
+            apply()
+        elif c == str(n + 1):
+            ok, cap = read_cap("FPS cap for every account (%d-%d, Enter=clear):" % (FPS_CAP_MIN, FPS_CAP_MAX))
+            if not ok:
+                continue
+            for _, _, uid, name in accts:
+                if cap:
+                    fc["accounts"][str(uid)] = {"name": name, "cap": cap}
+                else:
+                    fc["accounts"].pop(str(uid), None)
+            apply()
+        elif c == str(n + 2):
+            ok, cap = read_cap("Default (%d-%d, 0 or Enter=leave alone):" % (FPS_CAP_MIN, FPS_CAP_MAX), allow_zero=True)
+            if not ok:
+                continue
+            fc["default"] = cap or 0
+            apply()
+        elif c == str(n + 3):
+            if confirm("Clear all FPS caps?"):
+                fc["accounts"].clear()
+                fc["default"] = 0
+                apply()
+
+
 def menu_heartbeat(cfg):
     h = cfg.d["heartbeat"]
     while True:
         banner(cfg)
-        t = Table(title="Heartbeat (in-game script pings this tool)", box=box.ROUNDED, header_style="bold cyan")
+        t = Table(title="Heartbeat (in-game script that signals the tool)", box=box.ROUNDED, header_style="bold cyan")
         for col in ("#", "Item", "Value"):
             t.add_column(col)
         t.add_row("1", "Enable heartbeat (turn on once the script is installed in every clone)", onoff(h["enabled"]))
-        t.add_row("2", "Listening port (127.0.0.1)", str(h["port"]))
+        t.add_row("2", "Port to listen on (127.0.0.1)", str(h["port"]))
         t.add_row("3", "Script sends every (seconds)", str(h["interval"]))
-        t.add_row("4", "Treat as silent after (seconds)", str(h["timeout"]))
-        t.add_row("5", "Generate .lua scripts for each instance (heartbeat/ folder)", "")
-        t.add_row("6", "Delta autoexec folder (use {pkg} for one folder per clone)", T(", ".join(cfg.d["autoexec"]["dirs"])))
-        t.add_row("7", "Auto create/update heartbeat.lua in that folder", onoff(cfg.d["autoexec"]["auto_create"]))
+        t.add_row("4", "Treat as stopped when silent for more than (seconds)", str(h["timeout"]))
+        t.add_row("5", "Create a .lua script file for each instance (heartbeat/ folder)", "")
+        t.add_row("6", "Delta autoexec folder (use {pkg} = a separate folder per clone)", T(", ".join(cfg.d["autoexec"]["dirs"])))
+        t.add_row("7", "Create/update heartbeat.lua in that folder automatically", onoff(cfg.d["autoexec"]["auto_create"]))
         t.add_row("8", "Create/update heartbeat.lua now", "")
-        t.add_row("9", "Show the FPS box on the game screen (draggable, black with white border)", onoff(h["show_fps"]))
+        t.add_row("9", "Show the FPS number in the game (draggable, no frame, scales with the screen)", onoff(h["show_fps"]))
+        t.add_row("10", "FPS cap per account (Roblox ID fetched from the cookie) ...", T(fps_cap_summary(cfg)))
         console.print(t)
-        c = ask("Choose a number (0=back)")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c == "1":
@@ -2603,15 +3184,15 @@ def menu_heartbeat(cfg):
                 if cfg.d["autoexec"]["auto_create"]:
                     report_autoexec(cfg, install_autoexec(cfg))   # keep the installed script in sync (port/interval)
             elif v:
-                say("Value must be between %d-%d" % (lo, hi), "red")
+                say("Value must be between %d and %d" % (lo, hi), "red")
                 pause()
         elif c == "5":
             for p in write_heartbeat_files(cfg):
                 say("Created: " + p, "green")
-            say("Copy each clone's file into that clone's executor autoexec folder (or run it after joining a game)", "dim")
+            say("Copy each clone's file into that clone's executor autoexec folder (or run it when joining the game)", "dim")
             pause()
         elif c == "6":
-            v = ask("Autoexec folder path (Enter=keep, separate several folders with commas):")
+            v = ask("Autoexec folder path (Enter=no change, separate several folders with commas):")
             if v:
                 cfg.d["autoexec"]["dirs"] = [x.strip() for x in v.split(",") if x.strip().startswith("/")] or cfg.d["autoexec"]["dirs"]
         elif c == "7":
@@ -2623,67 +3204,10 @@ def menu_heartbeat(cfg):
             h["show_fps"] = not h["show_fps"]
             if cfg.d["autoexec"]["auto_create"]:
                 report_autoexec(cfg, install_autoexec(cfg), quiet_ok=False)
-                say("The new script loads the next time the game starts (rejoin or relaunch)", "dim")
+                say("The new script loads the next time the game is joined (rejoin or reopen)", "dim")
                 pause()
-        cfg.save()
-
-
-def menu_screen(cfg):
-    d, g = cfg.d["dialog_detect"], cfg.d["screen_guard"]
-    while True:
-        banner(cfg)
-        t = Table(title="Screen: Disconnected check / clear stacked windows", box=box.ROUNDED, header_style="bold cyan")
-        for col in ("#", "Item", "Value"):
-            t.add_column(col)
-        rows = [("Detect the Disconnected/Error window (e.g. Error Code 277) from screenshots, then rejoin", onoff(d["enabled"])),
-                ("Check every (seconds, 15-300)", str(d["every_sec"])),
-                ("Confirmations before rejoining (1-5)", str(d["confirm"])),
-                ("Auto-clear stacked windows (system error dialogs / duplicate tasks)", onoff(g["enabled"])),
-                ("Check every (seconds, 30-600)", str(g["check_sec"])),
-                ("force-stop apps with stacked windows (duplicate tasks)", onoff(g["fix_stacked"])),
-                ("Close stray apps covering the screen ⚠ (except Termux/system/launcher)", onoff(g["kill_stray"])),
-                ("Test Disconnected detection now (does nothing)", ""),
-                ("Check for stacked windows now (does nothing)", ""),
-                ("Clear the screen now (force)", "")]
-        for i, (label, val) in enumerate(rows, 1):
-            t.add_row(str(i), label, val)
-        console.print(t)
-        if not ENV.root:
-            say("All screen features need root (in non-root mode, cookies/heartbeat detect drops instead)", "yellow")
-        c = ask("Choose a number (0=back)")
-        if c == "0":
-            return
-        if c == "1":
-            d["enabled"] = not d["enabled"]
-        elif c == "4":
-            g["enabled"] = not g["enabled"]
-        elif c == "6":
-            g["fix_stacked"] = not g["fix_stacked"]
-        elif c == "7":
-            g["kill_stray"] = not g["kill_stray"]
-        elif c in ("2", "3", "5"):
-            sec, key, lo, hi = {"2": (d, "every_sec", 15, 300), "3": (d, "confirm", 1, 5), "5": (g, "check_sec", 30, 600)}[c]
-            v = ask("New value (%d-%d):" % (lo, hi))
-            if v.isdigit() and lo <= int(v) <= hi:
-                sec[key] = int(v)
-            elif v:
-                say("Value must be between %d-%d" % (lo, hi), "red")
-                pause()
-        elif c in ("8", "9", "10"):
-            if not ENV.root:
-                say("Root required", "red")
-            elif c == "8":
-                found, info = detect_screen_dialog()
-                say("Result: %s (%s)  focused window: %s" % (
-                    "Disconnected window found" if found else ("Not found" if found is False else "Cannot check"), info,
-                    parse_focus(foreground_text()) or "-"), "green" if found is False else "yellow")
-            else:
-                info = screen_scan(cfg)
-                say("Focus: %s | error window: %s | apps with duplicate tasks: %s" % (
-                    info["top"] or "-", ", ".join(sorted(info["dialogs"])) or "-", ", ".join(info["stacked"]) or "-"))
-                if c == "10":
-                    say("Done: " + ", ".join(screen_clear(cfg, info, force_all=True)), "green")
-            pause()
+        elif c == "10":
+            menu_fps_cap(cfg)
         cfg.save()
 
 
@@ -2691,22 +3215,22 @@ def menu_perf(cfg):
     r, p = cfg.d["ram"], cfg.d["performance"]
     while True:
         banner(cfg)
-        t = Table(title="Performance: clear RAM / reduce CPU use", box=box.ROUNDED, header_style="bold cyan")
+        t = Table(title="Performance: RAM cleanup / lower CPU usage", box=box.ROUNDED, header_style="bold cyan")
         for col in ("#", "Item", "Value"):
             t.add_column(col)
-        t.add_row("1", "Auto-clear RAM (root only)", onoff(r["enabled"]))
-        t.add_row("2", "Clear RAM every (minutes, 0=no scheduled clear)", str(r["interval_min"]))
-        t.add_row("3", "Clear when free RAM drops below (MB, 0=off)", str(r["min_free_mb"]))
-        t.add_row("4", "Also kill cached background apps (am kill-all) ⚠ may kill background clones", onoff(r["kill_cached"]))
-        t.add_row("5", "Safely close unrelated apps (force-stop user-installed apps except Roblox/Termux/Delta and the protect list in item 6)", onoff(r["kill_others"]))
-        t.add_row("6", "Apps never to close (parts of package names)", ", ".join(r["protect"]))
-        t.add_row("7", "Low-CPU mode (lower process priority, cache game state for 60s, slower screen refresh)", onoff(p["low_cpu"]))
+        t.add_row("1", "Automatic RAM cleanup (root only)", onoff(r["enabled"]))
+        t.add_row("2", "Clean RAM every (minutes, 0=not on a schedule)", str(r["interval_min"]))
+        t.add_row("3", "Clean when free RAM drops below (MB, 0=off)", str(r["min_free_mb"]))
+        t.add_row("4", "Also kill cached background apps (am kill-all) ⚠ may kill clones running in the background", onoff(r["kill_cached"]))
+        t.add_row("5", "Safely close unrelated apps (force-stop user-installed apps except Roblox/Termux/Delta and the list in item 6)", onoff(r["kill_others"]))
+        t.add_row("6", "Apps that must not be closed (part of the package name)", ", ".join(r["protect"]))
+        t.add_row("7", "Low-CPU mode (lower process priority, keep game status for 60 seconds, slower screen refresh)", onoff(p["low_cpu"]))
         t.add_row("8", "Refresh the status panel every (seconds, used with low-CPU mode)", str(p["ui_refresh_sec"]))
-        t.add_row("9", "Clear RAM now", "")
+        t.add_row("9", "Clean RAM now", "")
         console.print(t)
         free = mem_available_mb()
-        say("Free RAM now: %s MB%s" % (free if free is not None else "?", "" if ENV.root else "  (non-root mode cannot clear RAM)"), "dim")
-        c = ask("Choose a number (0=back)")
+        say("Free RAM now: %s MB%s" % (free if free is not None else "?", "" if ENV.root else "  (non-root mode cannot clean RAM)"), "dim")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c == "1":
@@ -2716,7 +3240,7 @@ def menu_perf(cfg):
         elif c == "5":
             r["kill_others"] = not r["kill_others"]
         elif c == "6":
-            v = ask("Protect list, comma-separated (Enter=keep as is):")
+            v = ask("Apps that must not be closed, separated by commas (Enter=keep current):")
             if v:
                 r["protect"] = [x.strip() for x in v.split(",") if x.strip()]
         elif c == "7":
@@ -2728,18 +3252,18 @@ def menu_perf(cfg):
             if v.isdigit() and lo <= int(v) <= hi:
                 sec[key] = int(v)
             elif v:
-                say("Value must be between %d-%d" % (lo, hi), "red")
+                say("Value must be between %d and %d" % (lo, hi), "red")
                 pause()
         elif c == "9":
             ok, b4, af = drop_ram(r["kill_cached"], cfg)
-            say(("RAM cleared: free %s → %s MB" % (b4, af)) if ok else ("RAM clear failed: " + RAM_LAST["detail"]),
+            say(("RAM cleaned: free %s → %s MB" % (b4, af)) if ok else ("RAM cleanup failed: " + RAM_LAST["detail"]),
                 "green" if ok else "red")
             if ok:
                 say("Step results: " + RAM_LAST["detail"], "dim")
                 if b4 is not None and af is not None and af - b4 < 100:
-                    say("Free RAM barely increased: drop_caches only frees cache, not RAM the apps are using", "yellow")
+                    say("Free RAM barely increased: drop_caches only clears caches, not the RAM apps are using", "yellow")
             elif ENV.root and not (r["kill_cached"] or r["kill_others"]):
-                say("Try enabling item 5 (safely close other apps) when drop_caches is locked (common on cloud phones/containers)", "yellow")
+                say("Try item 5 (safely close other apps) when drop_caches is locked (usually cloud phones/containers)", "yellow")
             pause()
         cfg.save()
 
@@ -2747,7 +3271,7 @@ def menu_perf(cfg):
 def menu_webhook(cfg, hook):
     w = cfg.d["webhook"]
     names = [("start", "Started"), ("crash", "Dropped/frozen"), ("rejoin", "Rejoined"), ("stop", "Stopped"),
-             ("status", "Status report + screenshot on a schedule")]
+             ("status", "Periodic status report + screenshot")]
     n_shot = 3 + len(names)
     n_per = n_shot + 1
     n_cu, n_ce, n_cf, n_ct, n_test = n_per + 1, n_per + 2, n_per + 3, n_per + 4, n_per + 5
@@ -2757,23 +3281,23 @@ def menu_webhook(cfg, hook):
         t = Table(title="Discord Webhook", box=box.ROUNDED, header_style="bold cyan")
         for col in ("#", "Item", "Value"):
             t.add_column(col)
-        t.add_row("1", "URL Webhook", T(scrub(w["url"]) or "(not set)"))
+        t.add_row("1", "Webhook URL", T(scrub(w["url"]) or "(not set)"))
         t.add_row("2", "Enable Webhook", onoff(w["enabled"]))
         for i, (k, label) in enumerate(names, 3):
             t.add_row(str(i), "Notify: " + label, onoff(w["events"][k]))
         t.add_row(str(n_shot), "Attach screenshot (root only, keeps the latest %d)" % MAX_SHOTS, onoff(w["send_screenshot"]))
-        t.add_row(str(n_per), "Send a status report + screenshot every N minutes (0=off)", str(w["periodic_min"]))
-        t.add_row(str(n_cu), "Console webhook: URL (empty = use main URL)", T(scrub(cw["url"]) or "(uses main URL)"))
-        t.add_row(str(n_ce), "Console webhook: send console output to Discord", onoff(cw["enabled"]))
-        t.add_row(str(n_cf), "Console webhook: batch and send every (seconds, 3-300)", str(cw["flush_sec"]))
+        t.add_row(str(n_per), "Send status report + screenshot every N minutes (0=off)", str(w["periodic_min"]))
+        t.add_row(str(n_cu), "Console webhook: URL (empty = use the main URL)", T(scrub(cw["url"]) or "(uses main URL)"))
+        t.add_row(str(n_ce), "Console webhook: send the console log to Discord", onoff(cw["enabled"]))
+        t.add_row(str(n_cf), "Console webhook: batch every (seconds, 3-300)", str(cw["flush_sec"]))
         t.add_row(str(n_ct), "Test console webhook", "")
-        t.add_row(str(n_test), "Send test message", "")
+        t.add_row(str(n_test), "Send a test message", "")
         console.print(t)
-        c = ask("Choose a number (0=back)")
+        c = ask("Pick a number (0=back)")
         if c == "0":
             return
         if c == "1":
-            v = ask("Paste the Webhook URL (Enter=remove):")
+            v = ask("Paste the Webhook URL (Enter=delete):")
             if not v:
                 w["url"], w["enabled"] = "", False
             elif HOOK_RE.match(v):
@@ -2796,7 +3320,7 @@ def menu_webhook(cfg, hook):
                 say("Must be a number 0-1440", "red")
                 pause()
         elif c == str(n_cu):
-            v = ask("Paste the Console webhook URL (Enter=use main URL):")
+            v = ask("Paste the Console webhook URL (Enter=use the main URL):")
             if not v:
                 cw["url"] = ""
             elif HOOK_RE.match(v):
@@ -2819,18 +3343,19 @@ def menu_webhook(cfg, hook):
                 say("No URL yet (set the main URL or the Console URL first)", "red")
             else:
                 ok = ch._post("GARNT TOOL REJOIN: console webhook test ✅")
-                say("Sent successfully" if ok else "Send failed, check the URL", "green" if ok else "red")
+                say("Sent" if ok else "Send failed, check the URL", "green" if ok else "red")
             pause()
         elif c == str(n_test):
             ok = hook.send("test", "✅ Webhook test", "Connected successfully", [("Mode", "ROOT" if ENV.root else "non-root")], sync=True)
-            say("Sent successfully" if ok else "Send failed, check the URL", "green" if ok else "red")
+            say("Sent" if ok else "Send failed, check the URL", "green" if ok else "red")
             pause()
         cfg.save()
 
 
-MENU = [("1", "Start auto-rejoin"), ("2", "Show instances / status"),
+MENU = [("1", "Start auto rejoin"), ("2", "Show instances / status"),
         ("3", "Settings (game link, check interval, launch delay)"), ("4", "Scan packages"),
-        ("5", "Cookies (login / pull from the Roblox app)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("8", "Block / unblock / add friend (with cookies)"), ("0", "Exit")]
+        ("5", "Cookies (login / pull from Roblox apps)"), ("6", "Auto settings"), ("7", "Discord Webhook"), ("8", "Block / unblock / add friends (using cookies)"),
+        ("9", "Open all Roblox (adjustable delay)"), ("0", "Exit")]
 
 
 def main():
@@ -2840,15 +3365,15 @@ def main():
     setup_logging()
     hook = Hook(cfg)
     apply_perf(cfg)
-    log.info("Program started, mode=%s folder=%s", "root" if ENV.root else "non-root", BASE)
+    log.info("Program started mode=%s folder=%s", "root" if ENV.root else "non-root", BASE)
     if not STORAGE_OK:
-        say("Cannot write to /sdcard/Download (storage permission not granted?). Using fallback folder: " + BASE, "yellow")
+        say("Cannot write to /sdcard/Download (storage permission not granted?), using the fallback folder: " + BASE, "yellow")
     say("Scanning packages...", "dim")
     refresh_packages(cfg)
     if cfg.d["autoexec"]["auto_create"]:
         report_autoexec(cfg, install_autoexec(cfg))
     if cfg.d["auto"]["start_on_launch"] and parse_link(cfg.d["game_link"]) and cfg.d["detected"]:
-        say("Auto-starting in 5 seconds (Ctrl+C to cancel)", "yellow")
+        say("Starting automatically in 5 seconds (Ctrl+C to cancel)", "yellow")
         try:
             time.sleep(5)
             menu_start(cfg, hook)
@@ -2859,7 +3384,7 @@ def main():
         for k, label in MENU:
             console.print(Text.assemble(("  [%s] " % k, "bold cyan"), (label, "bold" if k != "0" else "red")))
         console.print()
-        c = ask("Choose a menu:")
+        c = ask("Pick a menu:")
         if c == "1":
             menu_start(cfg, hook)
         elif c == "2":
@@ -2876,6 +3401,8 @@ def main():
             menu_webhook(cfg, hook)
         elif c == "8":
             menu_social(cfg)
+        elif c == "9":
+            menu_open_all(cfg)
         elif c == "0":
             say("Goodbye!", "cyan")
             return
