@@ -46,7 +46,7 @@ except ImportError as _e:
     print("Missing required library: %s\nRun: pip install -r requirements.txt" % _e)
     sys.exit(1)
 
-VERSION = "1.8"
+VERSION = "1.9"
 FPS_CAP_MIN, FPS_CAP_MAX = 5, 240
 ARCEUS_AUTOEXEC = "/storage/emulated/0/Arceus X/Autoexec"
 KNOWN_EXEC_DIRS = ("/storage/emulated/0/Delta/Autoexecute", ARCEUS_AUTOEXEC)
@@ -445,6 +445,7 @@ def AM():
 
 
 RAM_LAST = {"detail": ""}
+DROP = {"ok": None}   # None = not probed yet
 
 
 KEEP_PKGS = ["com.termux", "com.android.systemui", "com.topjohnwu.magisk"]
@@ -457,17 +458,19 @@ def kill_others(cfg):
     _, o3 = sh("pm list packages -3", root=True, timeout=30)
     third = {l.split(":", 1)[1].strip() for l in o3.splitlines() if l.startswith("package:")}
     snap = snapshot()
-    if not snap["ps_ok"]:
-        raise RuntimeError("cannot list processes")
-    running = {p.split(":")[0] for p in snap["procs"]}
+    ps_ok = snap["ps_ok"]                              # ps is blocked on some cloud phones/containers
+    running = {p.split(":")[0] for p in snap["procs"]} if ps_ok else set()
     # termux/root managers are ALWAYS protected, whatever the user types in the protect list
     prot = ([x.strip().lower() for x in r["protect"] if x.strip()] + [x.lower() for x in prefixes(cfg)] + [
                                                                       "termux", "magisk", "kernelsu", "supersu"])
     keep = set(cfg.d["detected"]) | set(KEEP_PKGS) | {home_pkg()}
-    victims = [p for p in sorted(third & running) if p not in keep and not any(x in p.lower() for x in prot)]
-    for p in victims:
-        sh(AM() + " force-stop " + shlex.quote(p), root=True, timeout=20)
-    return victims
+    pool = (third & running) if ps_ok else third       # no process list: force-stop is harmless on idle apps
+    victims = [p for p in sorted(pool) if p not in keep and not any(x in p.lower() for x in prot)]
+    if not ps_ok:
+        victims = victims[:60]
+    if victims:                                        # ONE shell call instead of one per app
+        sh("; ".join(AM() + " force-stop " + shlex.quote(p) for p in victims), root=True, timeout=60)
+    return victims, ps_ok
 
 
 def drop_ram(kill_cached=False, cfg=None):
@@ -478,23 +481,31 @@ def drop_ram(kill_cached=False, cfg=None):
         return False, None, None
     before = mem_available_mb()
     steps = []
-    rc, out = sh("sync; echo 3 > /proc/sys/vm/drop_caches", root=True, timeout=40)
-    steps.append(("drop_caches", rc == 0, out))
-    if rc != 0:  # read-only /proc/sys (containers / cloud phones) or SELinux: try sysctl
-        rc, out = sh("sysctl -w vm.drop_caches=3", root=True, timeout=20)
-        steps.append(("sysctl", rc == 0, out))
+    if DROP["ok"] is None:                             # probe once per run: /proc/sys is read-only on containers/cloud phones
+        rc, _ = sh("[ -w /proc/sys/vm/drop_caches ]", root=True, timeout=15)
+        DROP["ok"] = (rc == 0)
+        if not DROP["ok"]:
+            steps.append(("drop_caches", False, "unavailable here (read-only), skipped from now on"))
+    if DROP["ok"]:
+        rc, out = sh("sync; echo 3 > /proc/sys/vm/drop_caches", root=True, timeout=40)
+        if rc != 0:
+            DROP["ok"] = False                         # don't retry every cycle
+            steps.append(("drop_caches", False, "denied, skipped from now on"))
+        else:
+            steps.append(("drop_caches", True, ""))
     if kill_cached:
         rc, out = sh(AM() + " kill-all", root=True, timeout=30)
-        steps.append(("kill-all", rc == 0, out))
+        steps.append(("kill-all", rc == 0, "" if rc == 0 else "failed"))
     if cfg is not None and cfg.d["ram"]["kill_others"]:
         try:
-            v = kill_others(cfg)
-            steps.append(("kill-others", True, ("closed %d: %s" % (len(v), ", ".join(v))) if v else "nothing to close"))
+            v, ps_ok = kill_others(cfg)
+            note = "" if ps_ok else " (no process list: stopped all non-protected apps)"
+            steps.append(("kill-others", True, ("closed %d%s" % (len(v), note)) if v else "nothing to close"))
         except Exception as e:
-            steps.append(("kill-others", False, str(e)))
+            steps.append(("kill-others", False, "failed (%s)" % type(e).__name__))
     time.sleep(1)
     RAM_LAST["detail"] = "; ".join(
-        "%s: %s" % (n, "ok" if (ok and not m.strip()) else (" ".join(m.split())[:160] or "failed")) for n, ok, m in steps)
+        "%s: %s" % (n, "ok" if (ok and not m.strip()) else (" ".join(m.split())[:80] or "failed")) for n, ok, m in steps)
     log.info("ram steps: %s", RAM_LAST["detail"])
     return any(ok for _, ok, _ in steps), before, mem_available_mb()
 
