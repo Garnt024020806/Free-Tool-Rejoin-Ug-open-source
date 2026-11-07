@@ -47,7 +47,7 @@ The script does the following in order: `termux-setup-storage` → `pkg update/u
 
 ### Step 4 — Run the program (root mode)
 ```
-su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /storage/emulated/0/Download && python ./rejoin.py"
+su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /storage/emulated/0/Download && python ./rejoin_en.py"
 ```
 Non-root mode (or running from `~`):
 ```
