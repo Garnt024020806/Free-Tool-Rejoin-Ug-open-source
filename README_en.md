@@ -4,7 +4,7 @@
 
 An automatic Roblox rejoin tool for UG Phone + Termux (use it only with your own accounts and devices).
 
-> Note: this guide is translated, but the program itself still shows its menus and messages in Thai. Menu numbers in this guide match the numbers in the program.
+> The program has an English mode too: open menu **3** and choose option **5 "Language / ภาษา"** (it restarts itself), or start it with `REJOIN_LANG=en python rejoin.py`. The default language is Thai. Menu numbers are the same in both languages.
 
 **Download Material:** https://gofile.io/d/1y4Uo29l
 
@@ -101,7 +101,7 @@ The program detects the mode itself with `su -c id` — you do not need to say w
 
 ## 2. How to use
 
-1. Menu **3**: set the game link (Place ID, `roblox.com/games/...`, private-server link, share link, or `roblox://...` are supported) and adjust the check interval / launch delay.
+1. Menu **3**: set the game link (Place ID, `roblox.com/games/...`, private-server link, share link, or `roblox://...` are supported), adjust the check interval / launch delay, and switch the language (option 5).
 2. Menu **4**: scan `com.roblox.*` packages and choose which to run (`1,3` or `all`).
 3. (Optional) Menu **5** cookies: option 1 puts cookies from `cookie.txt` into the app (login) / option 2 **pulls cookies from the Roblox app** (root) into `cookie.txt` so they can be used for status checks through the API (cookies are validated against the API before saving; a line shown as `-` means that instance has no cookie; you can make it pull automatically before start in menu 6).
 4. (Optional) Menu **8** block / unblock / add friend using accounts from the cookies (you can pick accounts, and there is an option to add friends among your own accounts that sends the request and accepts it for you). Requests are spaced 1.5 seconds apart to avoid rate limits. Roblox may sometimes ask for a captcha, which the tool cannot solve.
