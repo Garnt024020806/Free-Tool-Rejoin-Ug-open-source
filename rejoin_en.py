@@ -3805,7 +3805,7 @@ def menu_list(cfg):
     pause()
 
 
-UPDATE_URL = "https://raw.githubusercontent.com/Garnt024020806/TOOL/main/rejoin.py"
+UPDATE_URL = "https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/main/rejoin.py"
 
 
 def _ver_tuple(v):
