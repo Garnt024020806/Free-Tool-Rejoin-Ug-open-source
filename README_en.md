@@ -22,7 +22,7 @@ Move with the arrow keys, press Space to select **Mirror group**, then select **
 
 **3. Install everything with one command**
 ```
-curl -Ls https://raw.githubusercontent.com/Garnt024020806/TOOL/main/setup.sh | bash
+curl -Ls https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/main/setup.sh | bash
 ```
 - A storage-permission popup will appear → tap **Allow** right away.
 - Wait until it finishes; this can take several minutes (if you allowed it late, run the same command again).
@@ -70,7 +70,7 @@ If you skip this step and `pkg update` is slow or gives a 404 error, come back a
 
 ### Step 2 — One-command install
 ```
-curl -Ls https://raw.githubusercontent.com/Garnt024020806/TOOL/main/setup.sh | bash
+curl -Ls https://raw.githubusercontent.com/Garnt024020806/Free-Tool-Rejoin-Ug-open-source/main/setup.sh | bash
 ```
 The script does, in order: `termux-setup-storage` → `pkg update/upgrade` → `python`, `python-pip`, `tsu`, `libexpat`, `openssl`, `openjdk-17` → `pip install -r requirements.txt` → downloads `rejoin.py` to `/sdcard/Download/rejoin.py` (plus a copy at `~/rejoin.py`).
 
